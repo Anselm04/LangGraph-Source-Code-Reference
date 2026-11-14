@@ -1,0 +1,14 @@
+name: One-time pinned langgraph source identity audit
+on:
+  push:
+    paths:
+      - '.github/workflows/audit-source-once.yml'
+permissions:
+  contents: write
+jobs:
+  audit:
+    uses: Anselm04/Macro-source-code-reference-/.github/workflows/reusable-source-audit.yml@main
+    with:
+      upstream_url: https://github.com/langchain-ai/langgraphjs.git
+      upstream_sha: 62e40b998f769ccf9d872d394d2fd3d6796a0ddf
+      audit_slug: langgraph
