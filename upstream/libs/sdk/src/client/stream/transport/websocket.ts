@@ -1,0 +1,483 @@
+import { AsyncQueue } from "./queue.js";
+import { encodePathSegment } from "../../base.js";
+import type {
+  Message,
+  Command,
+  CommandResponse,
+  ErrorResponse,
+} from "@langchain/protocol";
+
+import {
+  toAbsoluteUrl,
+  toWebSocketUrl,
+  isRecord,
+  isNonRetryableHttpError,
+  hasHeaders,
+  toError,
+  resolveProtocolPath,
+} from "./utils.js";
+import type {
+  HeaderValue,
+  ProtocolRequestHook,
+  PendingResponse,
+  ProtocolTransportPaths,
+  ProtocolWebSocketTransportOptions,
+} from "./types.js";
+import type { TransportAdapter } from "../transport.js";
+import { MaxWebSocketReconnectAttemptsError } from "../error.js";
+import {
+  DEFAULT_MAX_RECONNECT_ATTEMPTS,
+  reconnectDelayMs,
+  type ReconnectInfo,
+} from "../../../utils/reconnect.js";
+
+const WEB_SOCKET_CONNECTING = 0;
+const WEB_SOCKET_OPEN = 1;
+const WEB_SOCKET_CLOSED = 3;
+
+/**
+ * A server that rejects a connection after accepting it closes with 4000
+ * plus the HTTP status the SSE endpoint would return (4403, 4404, 4422).
+ * Keeping that `status` on the error lets a 4xx end the stream the same
+ * way it does on the SSE transport.
+ */
+function closeError(event: CloseEvent): Error {
+  const { code, reason } = event;
+  if (typeof code !== "number" || code < 4000 || code >= 5000) {
+    return new Error("Protocol WebSocket closed unexpectedly.");
+  }
+  return Object.assign(
+    new Error(
+      `Protocol WebSocket closed by the server: ${code}${reason ? ` ${reason}` : ""}`
+    ),
+    { status: code - 4000 }
+  );
+}
+
+/**
+ * Reconnect tuning for {@link ProtocolWebSocketTransportAdapter}. A subset
+ * of {@link ProtocolWebSocketTransportOptions}.
+ */
+export interface WebSocketReconnectOptions {
+  /**
+   * Maximum reconnection attempts after an unexpected disconnect.
+   * Defaults to {@link DEFAULT_MAX_RECONNECT_ATTEMPTS}.
+   */
+  maxReconnectAttempts?: number;
+
+  /** Invoked before each reconnect attempt with its scheduled delay. */
+  onReconnect?: (options: ReconnectInfo) => void;
+}
+
+/**
+ * Transport adapter that speaks the thread-centric protocol over a
+ * bidirectional WebSocket. Bound to a `threadId` at construction or later
+ * via {@link setThreadId} — the socket connects to
+ * `ws://.../threads/:thread_id/stream/events`.
+ *
+ * On unexpected disconnect the adapter reconnects with exponential
+ * backoff (see {@link ProtocolWebSocketTransportOptions.maxReconnectAttempts}),
+ * except when the server closes with a code for a 4xx status other than
+ * 408 or 429 (4403, 4404, 4422), which ends the event stream with an error
+ * carrying that `status`.
+ * The server replays buffered events on the new socket; the SDK
+ * deduplicates by `event_id`. {@link ProtocolWebSocketTransportOptions.onReconnected}
+ * runs after each successful reconnect so `ThreadStream` can re-issue
+ * `subscription.subscribe` commands.
+ */
+export class ProtocolWebSocketTransportAdapter implements TransportAdapter {
+  threadId: string;
+
+  private readonly queue = new AsyncQueue<Message>();
+
+  private readonly apiUrl: string;
+
+  private readonly defaultHeaders?: Record<string, HeaderValue>;
+
+  private readonly onRequest?: ProtocolRequestHook;
+
+  private readonly webSocketFactory: (url: string) => WebSocket;
+
+  private readonly paths?: Pick<ProtocolTransportPaths, "stream">;
+
+  private readonly maxReconnectAttempts: number;
+
+  private readonly onReconnect?: ProtocolWebSocketTransportOptions["onReconnect"];
+
+  private readonly onConnected?: ProtocolWebSocketTransportOptions["onConnected"];
+
+  private readonly reconnectDelayMs: (attempt: number) => number;
+
+  private onReconnected?: () => void | Promise<void>;
+
+  private readonly pending = new Map<number, PendingResponse>();
+
+  private socket: WebSocket | null = null;
+
+  private closed = false;
+
+  private intentionalClose = false;
+
+  private reconnectInFlight: Promise<void> | null = null;
+
+  constructor(options: ProtocolWebSocketTransportOptions) {
+    this.apiUrl = options.apiUrl;
+    this.threadId = options.threadId ?? "";
+    this.defaultHeaders = options.defaultHeaders;
+    this.onRequest = options.onRequest;
+    this.webSocketFactory =
+      options.webSocketFactory ?? ((url) => new WebSocket(url));
+    this.paths = options.paths;
+    this.maxReconnectAttempts =
+      options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
+    this.onReconnect = options.onReconnect;
+    this.onConnected = options.onConnected;
+    this.onReconnected = options.onReconnected;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? reconnectDelayMs;
+  }
+
+  /** {@inheritDoc TransportAdapter.setThreadId} */
+  setThreadId(threadId: string): void {
+    if (threadId === this.threadId) {
+      return;
+    }
+    if (
+      this.reconnectInFlight != null ||
+      (this.socket != null && this.socket.readyState !== WEB_SOCKET_CLOSED)
+    ) {
+      throw new Error(
+        "Protocol WebSocket transport cannot be rebound to a different thread while the socket is open. Close the current stream and create a new WebSocket transport for the new thread."
+      );
+    }
+    this.threadId = threadId;
+  }
+
+  /**
+   * Socket URL derives from the currently-bound thread so a single adapter
+   * can follow {@link setThreadId} re-binds; the next {@link open} connects
+   * to the new thread. A fixed `paths.stream` string overrides the default.
+   */
+  private get streamUrl(): string {
+    return resolveProtocolPath(
+      this.paths?.stream,
+      this.threadId,
+      (id) => `/threads/${encodePathSegment(id)}/stream/events`
+    );
+  }
+
+  /**
+   * Register a callback invoked after each successful reconnect. Used
+   * by {@link ThreadStream} to re-send active `subscription.subscribe`
+   * commands.
+   */
+  setOnReconnected(handler: () => void | Promise<void>): void {
+    this.onReconnected = handler;
+  }
+
+  async open(): Promise<void> {
+    const reconnecting = this.reconnectInFlight != null;
+    if (this.closed) {
+      throw new Error("Protocol WebSocket transport is closed.");
+    }
+    if (this.socket?.readyState === WEB_SOCKET_OPEN) {
+      return;
+    }
+    if (this.socket != null) {
+      this.#detachSocket(this.socket);
+      this.socket = null;
+    }
+
+    this.assertBrowserSafeTransportConfig();
+
+    const wsUrl = toWebSocketUrl(
+      toAbsoluteUrl(this.apiUrl, this.streamUrl).toString()
+    );
+    const socket = this.webSocketFactory(wsUrl);
+    this.socket = socket;
+    this.intentionalClose = false;
+
+    this.#attachSocket(socket);
+
+    await new Promise<void>((resolve, reject) => {
+      const onOpen = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("Failed to open protocol WebSocket."));
+      };
+      const cleanup = () => {
+        socket.removeEventListener("open", onOpen);
+        socket.removeEventListener("error", onError);
+      };
+      socket.addEventListener("open", onOpen, { once: true });
+      socket.addEventListener("error", onError, { once: true });
+    });
+
+    if (!reconnecting) {
+      await this.onConnected?.({ kind: "initial", attempt: 0 });
+    }
+  }
+
+  async send(
+    command: Command
+  ): Promise<CommandResponse | ErrorResponse | void> {
+    return await this.sendCommand(command);
+  }
+
+  events(): AsyncIterable<Message> {
+    const queue = this.queue;
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => await queue.shift(),
+        return: async () => {
+          queue.close();
+          return { done: true, value: undefined };
+        },
+      }),
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
+    this.intentionalClose = true;
+
+    for (const { reject } of this.pending.values()) {
+      reject(new Error("Protocol WebSocket connection closed."));
+    }
+    this.pending.clear();
+    this.queue.close();
+
+    const socket = this.socket;
+    this.socket = null;
+    if (!socket) {
+      return;
+    }
+
+    this.#detachSocket(socket);
+
+    await new Promise<void>((resolve) => {
+      if (socket.readyState === WEB_SOCKET_CLOSED) {
+        resolve();
+        return;
+      }
+
+      const onClose = () => {
+        socket.removeEventListener("close", onClose);
+        resolve();
+      };
+
+      socket.addEventListener("close", onClose, { once: true });
+      if (
+        socket.readyState === WEB_SOCKET_OPEN ||
+        socket.readyState === WEB_SOCKET_CONNECTING
+      ) {
+        socket.close();
+      } else {
+        resolve();
+      }
+    });
+  }
+
+  private assertBrowserSafeTransportConfig(): void {
+    if (hasHeaders(this.defaultHeaders) || this.onRequest != null) {
+      throw new Error(
+        "Browser WebSocket protocol transport does not support defaultHeaders or onRequest hooks. Supply a custom protocolWebSocketFactory if you need custom WebSocket setup."
+      );
+    }
+  }
+
+  private async sendCommand(
+    command: Command
+  ): Promise<CommandResponse | ErrorResponse> {
+    if (this.closed) {
+      throw new Error("Protocol WebSocket transport is closed.");
+    }
+    // Wait for an in-flight reconnect only when the socket is not usable.
+    // After `open()` succeeds, `#runReconnectLoop` may still be awaiting
+    // `onReconnected` (e.g. ThreadStream resubscribe). Those callbacks call
+    // `sendCommand` and must not await the same `reconnectInFlight` promise.
+    let socket = this.socket;
+    if (
+      this.reconnectInFlight != null &&
+      (socket == null || socket.readyState !== WEB_SOCKET_OPEN)
+    ) {
+      await this.reconnectInFlight.catch(() => undefined);
+      socket = this.socket;
+    }
+
+    if (socket == null || socket.readyState !== WEB_SOCKET_OPEN) {
+      throw new Error("Protocol WebSocket is not open.");
+    }
+
+    return await new Promise<CommandResponse | ErrorResponse>(
+      (resolve, reject) => {
+        this.pending.set(command.id, { resolve, reject });
+
+        try {
+          socket.send(JSON.stringify(command));
+        } catch (error) {
+          this.pending.delete(command.id);
+          reject(toError(error));
+        }
+      }
+    );
+  }
+
+  #attachSocket(socket: WebSocket): void {
+    socket.addEventListener("message", this.handleMessage);
+    socket.addEventListener("close", this.handleClose);
+    socket.addEventListener("error", this.handleSocketError);
+  }
+
+  #detachSocket(socket: WebSocket): void {
+    socket.removeEventListener("message", this.handleMessage);
+    socket.removeEventListener("close", this.handleClose);
+    socket.removeEventListener("error", this.handleSocketError);
+  }
+
+  private readonly handleMessage = (event: MessageEvent): void => {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+
+    if (
+      isRecord(payload) &&
+      typeof payload.id === "number" &&
+      (payload.type === "success" || payload.type === "error")
+    ) {
+      const pending = this.pending.get(payload.id);
+      if (pending) {
+        this.pending.delete(payload.id);
+        pending.resolve(payload as CommandResponse | ErrorResponse);
+      }
+      return;
+    }
+
+    if (isRecord(payload) && payload.type === "event") {
+      this.queue.push(payload as Message);
+    }
+  };
+
+  private readonly handleClose = (event: CloseEvent): void => {
+    const socket = this.socket;
+    if (socket != null) {
+      this.#detachSocket(socket);
+    }
+    this.socket = null;
+
+    if (this.intentionalClose || this.closed) {
+      this.queue.close();
+      return;
+    }
+
+    const error = closeError(event);
+    if (isNonRetryableHttpError(error)) {
+      this.#closeWithError(error);
+      return;
+    }
+
+    this.#handleUnexpectedDisconnect(error);
+  };
+
+  private readonly handleSocketError = (): void => {
+    if (this.closed || this.intentionalClose) {
+      return;
+    }
+
+    this.#handleUnexpectedDisconnect(
+      new Error("Protocol WebSocket encountered an error.")
+    );
+  };
+
+  /**
+   * End the transport for good: a reconnect would be rejected the same way.
+   * Marking it closed also stops a reconnect loop that is in flight.
+   */
+  #closeWithError(error: Error): void {
+    this.closed = true;
+    for (const { reject } of this.pending.values()) {
+      reject(error);
+    }
+    this.pending.clear();
+    this.queue.close(error);
+  }
+
+  #handleUnexpectedDisconnect(cause: unknown): void {
+    const error = toError(cause);
+    for (const { reject } of this.pending.values()) {
+      reject(error);
+    }
+    this.pending.clear();
+
+    if (this.maxReconnectAttempts <= 0) {
+      this.queue.close(error);
+      return;
+    }
+
+    this.#scheduleReconnect(cause);
+  }
+
+  #scheduleReconnect(cause: unknown): void {
+    if (this.closed || this.intentionalClose) {
+      return;
+    }
+    if (this.reconnectInFlight != null) {
+      return;
+    }
+
+    this.reconnectInFlight = Promise.resolve()
+      .then(() => this.#runReconnectLoop(cause))
+      .finally(() => {
+        this.reconnectInFlight = null;
+      });
+  }
+
+  async #runReconnectLoop(initialCause: unknown): Promise<void> {
+    let lastError: unknown = initialCause;
+
+    for (let attempt = 1; attempt <= this.maxReconnectAttempts; attempt += 1) {
+      if (this.closed || this.intentionalClose) {
+        return;
+      }
+
+      const delay = this.reconnectDelayMs(attempt);
+      this.onReconnect?.({ attempt, cause: lastError, delayMs: delay });
+      if (delay > 0) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, delay);
+        });
+      }
+
+      if (this.closed || this.intentionalClose) {
+        return;
+      }
+
+      try {
+        await this.open();
+        if (this.onReconnected) {
+          await this.onReconnected();
+        }
+        await this.onConnected?.({ kind: "reconnected", attempt });
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    this.queue.close(
+      new MaxWebSocketReconnectAttemptsError(
+        this.maxReconnectAttempts,
+        lastError
+      )
+    );
+  }
+}

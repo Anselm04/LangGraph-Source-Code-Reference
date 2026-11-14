@@ -1,0 +1,327 @@
+import pRetryImport from "p-retry";
+import PQueueMod from "p-queue";
+import { _getFetchImplementation } from "../singletons/fetch.js";
+
+/**
+ * `p-retry` is a pure-ESM module that we bundle into the build output (so the
+ * CJS artifact doesn't `require()` an ESM module). Depending on how a
+ * downstream transpiler/bundler (e.g. `tsx`/esbuild) resolves the default
+ * export of the bundled chunk, the import can come through either as the
+ * function itself or as a namespace-like `{ default: fn }`. Normalize to the
+ * callable, mirroring the `"default" in` interop guard used for `p-queue`.
+ */
+const pRetry = (
+  typeof pRetryImport === "function"
+    ? pRetryImport
+    : (pRetryImport as { default: typeof pRetryImport }).default
+) as typeof pRetryImport;
+
+const STATUS_NO_RETRY = [
+  400, // Bad Request
+  401, // Unauthorized
+  402, // Payment required
+  403, // Forbidden
+  404, // Not Found
+  405, // Method Not Allowed
+  406, // Not Acceptable
+  407, // Proxy Authentication Required
+  408, // Request Timeout
+  409, // Conflict
+  422, // Unprocessable Entity
+];
+
+// Methods that are safe to send again after the server may have received them.
+const IDEMPOTENT_METHODS = ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"];
+
+// Failures that prove the request never reached the server: the host could
+// not be resolved or reached, or it refused the connection.
+const CONNECT_ERROR_CODES = [
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "ConnectionRefused", // Bun
+];
+
+function isConnectError(error: unknown): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { code, cause } = (error ?? {}) as any;
+  if (CONNECT_ERROR_CODES.includes(code)) return true;
+  // Node's fetch (undici) puts the socket error on `cause`, and an
+  // AggregateError there when it tried several addresses.
+  if (cause == null || cause === error) return false;
+  if (Array.isArray(cause.errors) && cause.errors.some(isConnectError)) {
+    return true;
+  }
+  return isConnectError(cause);
+}
+
+type ResponseCallback = (response?: Response) => Promise<boolean>;
+
+export interface AsyncCallerParams {
+  /**
+   * The maximum number of concurrent calls that can be made.
+   * Defaults to `Infinity`, which means no limit.
+   */
+  maxConcurrency?: number;
+  /**
+   * The maximum number of retries that can be made for a single call,
+   * with an exponential backoff between each attempt. Defaults to 6.
+   */
+  maxRetries?: number;
+
+  onFailedResponseHook?: ResponseCallback;
+
+  /**
+   * Specify a custom fetch implementation.
+   *
+   * By default we expect the `fetch` is available in the global scope.
+   */
+  fetch?: typeof fetch | ((...args: any[]) => any); // eslint-disable-line @typescript-eslint/no-explicit-any
+}
+
+export interface AsyncCallerCallOptions {
+  signal?: AbortSignal;
+  /**
+   * The HTTP method of the request the callable sends. A request that is not
+   * idempotent (e.g. `POST`, `PATCH`) is retried only when it failed before
+   * it reached the server, since sending it again could repeat its effect.
+   * Omit for callables that send no HTTP request.
+   */
+  method?: string;
+}
+
+/**
+ * Do not rely on globalThis.Response, rather just
+ * do duck typing
+ */
+function isResponse(x: unknown): x is Response {
+  if (x == null || typeof x !== "object") return false;
+  return "status" in x && "statusText" in x && "text" in x;
+}
+
+/**
+ * Utility error to properly handle failed requests
+ */
+class HTTPError extends Error {
+  status: number;
+
+  text: string;
+
+  response?: Response;
+
+  constructor(status: number, message: string, response?: Response) {
+    super(`HTTP ${status}: ${message}`);
+    this.status = status;
+    this.text = message;
+    this.response = response;
+  }
+
+  static async fromResponse(
+    response: Response,
+    options?: { includeResponse?: boolean }
+  ): Promise<HTTPError> {
+    try {
+      return new HTTPError(
+        response.status,
+        await response.text(),
+        options?.includeResponse ? response : undefined
+      );
+    } catch {
+      return new HTTPError(
+        response.status,
+        response.statusText,
+        options?.includeResponse ? response : undefined
+      );
+    }
+  }
+}
+
+/**
+ * A class that can be used to make async calls with concurrency and retry logic.
+ *
+ * This is useful for making calls to any kind of "expensive" external resource,
+ * be it because it's rate-limited, subject to network issues, etc.
+ *
+ * Concurrent calls are limited by the `maxConcurrency` parameter, which defaults
+ * to `Infinity`. This means that by default, all calls will be made in parallel.
+ *
+ * Retries are limited by the `maxRetries` parameter, which defaults to 5. This
+ * means that by default, each call will be retried up to 5 times, with an
+ * exponential backoff between each attempt.
+ */
+export class AsyncCaller {
+  protected maxConcurrency: AsyncCallerParams["maxConcurrency"];
+
+  protected maxRetries: AsyncCallerParams["maxRetries"];
+
+  private queue: (typeof import("p-queue"))["default"]["prototype"];
+
+  private onFailedResponseHook?: ResponseCallback;
+
+  private customFetch?: typeof fetch;
+
+  constructor(params: AsyncCallerParams) {
+    this.maxConcurrency = params.maxConcurrency ?? Infinity;
+    this.maxRetries = params.maxRetries ?? 4;
+
+    if ("default" in PQueueMod) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.queue = new (PQueueMod.default as any)({
+        concurrency: this.maxConcurrency,
+      });
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      this.queue = new (PQueueMod as any)({ concurrency: this.maxConcurrency });
+    }
+    this.onFailedResponseHook = params?.onFailedResponseHook;
+    this.customFetch = params.fetch;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  call<A extends any[], T extends (...args: A) => Promise<any>>(
+    callable: T,
+    ...args: Parameters<T>
+  ): Promise<Awaited<ReturnType<T>>> {
+    return this.callWithRetry(undefined, callable, ...args);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private callWithRetry<
+    A extends any[],
+    T extends (...args: A) => Promise<any>,
+  >(
+    method: string | undefined,
+    callable: T,
+    ...args: Parameters<T>
+  ): Promise<Awaited<ReturnType<T>>> {
+    const { onFailedResponseHook } = this;
+    const retryAnyFailure =
+      method === undefined || IDEMPOTENT_METHODS.includes(method.toUpperCase());
+    return this.queue.add(
+      () =>
+        pRetry(
+          () =>
+            callable(...(args as Parameters<T>)).catch(async (error) => {
+              // eslint-disable-next-line no-instanceof/no-instanceof
+              if (error instanceof Error) {
+                throw error;
+              } else if (isResponse(error)) {
+                // Always attach the failed Response so callers can inspect
+                // error.response without registering onFailedResponseHook.
+                throw await HTTPError.fromResponse(error, {
+                  includeResponse: true,
+                });
+              } else {
+                throw new Error(error);
+              }
+            }),
+          {
+            async onFailedAttempt({ error, retriesLeft }) {
+              const errorMessage = error.message ?? "";
+              if (
+                error.name === "AbortError" ||
+                error.name === "TimeoutError" ||
+                errorMessage.startsWith("Cancel") ||
+                errorMessage.startsWith("TimeoutError") ||
+                errorMessage.startsWith("AbortError")
+              ) {
+                throw error;
+              }
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              if ((error as any)?.code === "ECONNABORTED") {
+                throw error;
+              }
+
+              // Check for connection refused errors (server not running)
+              if (
+                errorMessage.includes("ECONNREFUSED") ||
+                errorMessage.includes("fetch failed") ||
+                errorMessage.includes("Failed to fetch") ||
+                errorMessage.includes("NetworkError")
+              ) {
+                if (
+                  retriesLeft > 0 &&
+                  (retryAnyFailure || isConnectError(error))
+                ) {
+                  return;
+                }
+                const connectionError = new Error(
+                  `Unable to connect to LangGraph server. Please ensure the server is running and accessible. Original error: ${errorMessage}`
+                );
+                connectionError.name = "ConnectionError";
+                throw connectionError;
+              }
+
+              // eslint-disable-next-line no-instanceof/no-instanceof
+              if (error instanceof HTTPError) {
+                if (STATUS_NO_RETRY.includes(error.status)) {
+                  throw error;
+                }
+                if (onFailedResponseHook && error.response) {
+                  await onFailedResponseHook(error.response);
+                }
+              }
+
+              // The server may have acted on a request that is not
+              // idempotent, and sending it again could repeat that (e.g.
+              // create a second run).
+              if (!retryAnyFailure && !isConnectError(error)) {
+                throw error;
+              }
+            },
+            // If needed we can change some of the defaults here,
+            // but they're quite sensible.
+            retries: this.maxRetries,
+            randomize: true,
+          }
+        ),
+      { throwOnTimeout: true }
+    );
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callWithOptions<A extends any[], T extends (...args: A) => Promise<any>>(
+    options: AsyncCallerCallOptions,
+    callable: T,
+    ...args: Parameters<T>
+  ): Promise<Awaited<ReturnType<T>>> {
+    // Note this doesn't cancel the underlying request,
+    // when available prefer to use the signal option of the underlying call
+    if (options.signal) {
+      return Promise.race([
+        this.callWithRetry<A, T>(options.method, callable, ...args),
+        new Promise<never>((_, reject) => {
+          options.signal?.addEventListener("abort", () => {
+            reject(new Error("AbortError"));
+          });
+        }),
+      ]);
+    }
+    return this.callWithRetry<A, T>(options.method, callable, ...args);
+  }
+
+  fetch(...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
+    const fetchFn =
+      this.customFetch ?? (_getFetchImplementation() as typeof fetch);
+    const [input, init] = args;
+    const method =
+      init?.method ??
+      (typeof input === "object" && "method" in input ? input.method : "GET");
+    return this.callWithRetry(method, () =>
+      fetchFn(...args).then((res) => (res.ok ? res : Promise.reject(res)))
+    );
+  }
+
+  /**
+   * Sends one request with no retries and resolves with the response
+   * whatever its status, for callers that run their own retry loop.
+   */
+  fetchOnce(...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
+    const fetchFn =
+      this.customFetch ?? (_getFetchImplementation() as typeof fetch);
+    return this.queue.add(() => fetchFn(...args), { throwOnTimeout: true });
+  }
+}

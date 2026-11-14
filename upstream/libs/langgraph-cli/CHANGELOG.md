@@ -1,0 +1,715 @@
+# @langchain/langgraph-cli
+
+## 1.7.2
+
+### Patch Changes
+
+- Updated dependencies [[`6dd190c`](https://github.com/langchain-ai/langgraphjs/commit/6dd190c558f9dc4012cdf6aaf142788ae7dbc444)]:
+  - @langchain/langgraph-api@1.7.2
+
+## 1.7.1
+
+### Patch Changes
+
+- Updated dependencies [[`904126c`](https://github.com/langchain-ai/langgraphjs/commit/904126cef1dcc758ac7dd13d330f8595deeed65b), [`c5ad00f`](https://github.com/langchain-ai/langgraphjs/commit/c5ad00f399d4f815376c88d4ef3e9bcd6fe81c54)]:
+  - @langchain/langgraph-api@1.7.1
+
+## 1.7.0
+
+### Patch Changes
+
+- Updated dependencies [[`badfe38`](https://github.com/langchain-ai/langgraphjs/commit/badfe38413720fe2bf21b81dd52cd6e74f86d845), [`397e93e`](https://github.com/langchain-ai/langgraphjs/commit/397e93e0d2b47c3d9ed914c7937b92c9fd95d532), [`6fb340e`](https://github.com/langchain-ai/langgraphjs/commit/6fb340e306e33f95cdb2d2a0a7eaebcc154152f1), [`ffe9e60`](https://github.com/langchain-ai/langgraphjs/commit/ffe9e60a5d3fdabbcbd6c814b18cf3d9fc01a34b), [`184ce74`](https://github.com/langchain-ai/langgraphjs/commit/184ce74a7aac02c2337fb4909da547b7ef39912a), [`5d1ceb0`](https://github.com/langchain-ai/langgraphjs/commit/5d1ceb0016cf8a5304c75554c99d3d79f81470ac), [`bdec328`](https://github.com/langchain-ai/langgraphjs/commit/bdec328a80439ce1d3974b10aa9e7b7f297da1b1), [`95ce066`](https://github.com/langchain-ai/langgraphjs/commit/95ce066af5a71c7ad114ccc538fd02dae300561a)]:
+  - @langchain/langgraph-api@1.7.0
+
+## 1.6.0
+
+### Patch Changes
+
+- Updated dependencies [[`b82c080`](https://github.com/langchain-ai/langgraphjs/commit/b82c080d43ae71d45ec776f55d45e6ace67c2c9e), [`024c902`](https://github.com/langchain-ai/langgraphjs/commit/024c902ef59dea82d4e121e1ecb882f370326cf0), [`881a734`](https://github.com/langchain-ai/langgraphjs/commit/881a7347fc510770b450ac8c70bef5e1bdacdd57), [`b82c080`](https://github.com/langchain-ai/langgraphjs/commit/b82c080d43ae71d45ec776f55d45e6ace67c2c9e), [`ceefe05`](https://github.com/langchain-ai/langgraphjs/commit/ceefe0575f49a7fdfbfc60d33eb5ece5f3de3bad), [`b2c3d0b`](https://github.com/langchain-ai/langgraphjs/commit/b2c3d0b2a7cfe6e9e8a4944840d75835ee9ae4ee)]:
+  - @langchain/langgraph-api@1.6.0
+
+## 1.5.8
+
+### Patch Changes
+
+- Updated dependencies [[`478fffd`](https://github.com/langchain-ai/langgraphjs/commit/478fffdaf6dfcdd1c2fd0e977f53d2fcd8af8af3)]:
+  - @langchain/langgraph-api@1.5.8
+
+## 1.5.7
+
+### Patch Changes
+
+- Updated dependencies [[`e26cb84`](https://github.com/langchain-ai/langgraphjs/commit/e26cb846363dae6f4ae337d99a6340aba3673905), [`844f6fc`](https://github.com/langchain-ai/langgraphjs/commit/844f6fcafc8ad1b0b56b69bec302e25968fb974d), [`32542a5`](https://github.com/langchain-ai/langgraphjs/commit/32542a57e86fd55406eeaf08f850f6eaaf9a6583), [`824f24c`](https://github.com/langchain-ai/langgraphjs/commit/824f24ced5ee5a6d1c60c66b52031d61c2f7f30e), [`3f21e26`](https://github.com/langchain-ai/langgraphjs/commit/3f21e26235f04e1181facccf11166720b082b185), [`3f21e26`](https://github.com/langchain-ai/langgraphjs/commit/3f21e26235f04e1181facccf11166720b082b185), [`3f21e26`](https://github.com/langchain-ai/langgraphjs/commit/3f21e26235f04e1181facccf11166720b082b185)]:
+  - @langchain/langgraph-api@1.5.7
+
+## 1.5.6
+
+### Patch Changes
+
+- [#3095](https://github.com/langchain-ai/langgraphjs/pull/3095) [`75d179c`](https://github.com/langchain-ai/langgraphjs/commit/75d179cf63baa5f197b7f03b6f4928c05724fb16) Thanks [@raghavverma-langchain](https://github.com/raghavverma-langchain)! - `langgraphjs deploy --remote` sends the headers the control plane returns with its source upload, so uploads work with storage that needs extra headers, such as Azure Blob Storage. Control planes that return none keep the previous behavior.
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.5.6
+
+## 1.5.5
+
+### Patch Changes
+
+- Updated dependencies [[`a17f609`](https://github.com/langchain-ai/langgraphjs/commit/a17f6098a853d1051c810f2c8dffa15e4de8f083)]:
+  - @langchain/langgraph-api@1.5.5
+
+## 1.5.4
+
+### Patch Changes
+
+- [#3037](https://github.com/langchain-ai/langgraphjs/pull/3037) [`6180711`](https://github.com/langchain-ai/langgraphjs/commit/61807113665e4875c6ec8fd34c6f6c9f7becf497) Thanks [@raghavverma-langchain](https://github.com/raghavverma-langchain)! - `langgraphjs deploy` local builds push through your active Docker context. Before, the push used a temporary Docker config with no current context and failed with `failed to connect to the docker API at unix:///var/run/docker.sock` on setups like Docker Desktop without the default socket. An explicit `DOCKER_HOST` is still respected.
+
+- [#3021](https://github.com/langchain-ai/langgraphjs/pull/3021) [`23c8d09`](https://github.com/langchain-ai/langgraphjs/commit/23c8d0977773bef91bc2cab7d6eb3b5d6fb651dc) Thanks [@raghavverma-langchain](https://github.com/raghavverma-langchain)! - `langgraphjs deploy` local builds log in with the registry username the control plane returns and push to its `repository_url` when it sends one, so they work on LangSmith AWS. Control planes that return neither keep the previous behavior.
+- Updated dependencies [[`06f9fdb`](https://github.com/langchain-ai/langgraphjs/commit/06f9fdbb76facef0d4f2100e14baa99ef8f0bd2b)]:
+  - @langchain/langgraph-api@1.5.4
+
+## 1.5.3
+
+### Patch Changes
+
+- Updated dependencies [[`1631fd8`](https://github.com/langchain-ai/langgraphjs/commit/1631fd895723c4553345ceb5d9fc425b68bda959)]:
+  - @langchain/langgraph-api@1.5.3
+
+## 1.5.2
+
+### Patch Changes
+
+- [#2887](https://github.com/langchain-ai/langgraphjs/pull/2887) [`8f8eaa8`](https://github.com/langchain-ai/langgraphjs/commit/8f8eaa8686dab8ba9d35eac9934c590ecbbe11f6) Thanks [@syachamaneni-lc](https://github.com/syachamaneni-lc)! - add --agent-id and --agent-environment flags
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.5.2
+
+## 1.5.2-dev.0
+
+### Patch Changes
+
+- [#2887](https://github.com/langchain-ai/langgraphjs/pull/2887) [`8f8eaa8`](https://github.com/langchain-ai/langgraphjs/commit/8f8eaa8686dab8ba9d35eac9934c590ecbbe11f6) Thanks [@syachamaneni-lc](https://github.com/syachamaneni-lc)! - add --agent-id and --agent-environment flags
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.5.2-dev.0
+
+## 1.5.1
+
+### Patch Changes
+
+- [#2874](https://github.com/langchain-ai/langgraphjs/pull/2874) [`92e250c`](https://github.com/langchain-ai/langgraphjs/commit/92e250c02c2f01a1710cb00112b3c95db50140c0) Thanks [@ataller-lc](https://github.com/ataller-lc)! - Add `--studio-url` to `langgraphjs dev`, so the printed and auto-opened Studio link can point at a self-hosted LangSmith instance instead of `https://smith.langchain.com`. The flag takes precedence over the host derived from `LANGSMITH_ENDPOINT`, matching the Python CLI, and is forwarded when `dev` serves a Python project.
+
+- [#2872](https://github.com/langchain-ai/langgraphjs/pull/2872) [`686504e`](https://github.com/langchain-ai/langgraphjs/commit/686504e7edbe9d63558c160f1afa43f3964ad568) Thanks [@sz-lc-mdm-captive](https://github.com/sz-lc-mdm-captive)! - Resolve the `docker` binary from the inherited environment instead of a synthesised `PATH`, fixing `build`, `up`, `deploy` and `dockerfile --add-docker-compose` on Linux and Windows.
+  
+  The CLI previously discarded the caller's `PATH` and rebuilt one, first by probing the login shell through `dscl` (macOS Directory Services) and then by falling back to a hardcoded list of macOS install locations. Both strategies originate from LangGraph Studio's desktop app, where a Finder-launched process inherits launchd's minimal environment; neither applies to a CLI invoked from a terminal or from CI.
+  
+  On Linux the `dscl` probe reported success with empty output, because the missing command sat on the left of a pipe and the shell returned `sed`'s exit status. Discovery then degraded to the hardcoded list, which omits `/usr/local/bin` — where Docker's install script and most CI images place the binary — so the CLI reported "Docker is required but not installed" on machines where `docker` was installed and on `PATH`. On Windows the fallback could never succeed, since verification shelled out to `which`.
+  
+  Docker is now spawned the way any other command is, so `PATH`, `DOCKER_HOST` and credential helpers all behave as the caller configured them. A missing binary is reported separately from a daemon that is not running, matching the Python CLI.
+- Updated dependencies [[`545c7d1`](https://github.com/langchain-ai/langgraphjs/commit/545c7d189883a01c8723f3ed782d347732c00b60)]:
+  - @langchain/langgraph-api@1.5.1
+
+## 1.5.1-rc.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.5.1-rc.0
+
+## 1.5.0
+
+### Patch Changes
+
+- Updated dependencies [[`48245a8`](https://github.com/langchain-ai/langgraphjs/commit/48245a84c5348ea09780d85c41b6e5a09bb318df)]:
+  - @langchain/langgraph-api@1.5.0
+
+## 1.4.6
+
+### Patch Changes
+
+- Updated dependencies [[`0a9611a`](https://github.com/langchain-ai/langgraphjs/commit/0a9611af927bd7933e6eb96161acd86584f0d4b0)]:
+  - @langchain/langgraph-api@1.4.6
+
+## 1.4.6-rc.0
+
+### Patch Changes
+
+- Updated dependencies [[`0a9611a`](https://github.com/langchain-ai/langgraphjs/commit/0a9611af927bd7933e6eb96161acd86584f0d4b0)]:
+  - @langchain/langgraph-api@1.4.6-rc.0
+
+## 1.4.5
+
+### Patch Changes
+
+- Updated dependencies [[`a2a59ec`](https://github.com/langchain-ai/langgraphjs/commit/a2a59ec6f8fdd93d4520d86fceab8a234dacf978)]:
+  - @langchain/langgraph-api@1.4.5
+
+## 1.4.4
+
+### Patch Changes
+
+- [#2645](https://github.com/langchain-ai/langgraphjs/pull/2645) [`059f3b8`](https://github.com/langchain-ai/langgraphjs/commit/059f3b8200d1f2f6bd701eb26bac24675395918a) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(langgraph-api): stop wiping graph recursionLimit with undefined
+
+  When a run omitted `config.recursion_limit`, the server still passed
+  `recursionLimit: undefined` into `streamEvents`. Pregel spreads that over the
+  graph's `withConfig` default, so agents fell back to langchain-core's 25.
+  Omit undefined keys so bound limits (and deepagents' 10000) stick.
+
+- Updated dependencies [[`059f3b8`](https://github.com/langchain-ai/langgraphjs/commit/059f3b8200d1f2f6bd701eb26bac24675395918a)]:
+  - @langchain/langgraph-api@1.4.4
+
+## 1.4.3
+
+### Patch Changes
+
+- [#2595](https://github.com/langchain-ai/langgraphjs/pull/2595) [`dac8c2f`](https://github.com/langchain-ai/langgraphjs/commit/dac8c2fa7edfd643aa393a1d6407759b6cd8acf4) Thanks [@christian-bromann](https://github.com/christian-bromann)! - chore: bump langsmith to ^0.8.0
+
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.4.3
+
+## 1.4.2
+
+### Patch Changes
+
+- [#2590](https://github.com/langchain-ai/langgraphjs/pull/2590) [`f71e00c`](https://github.com/langchain-ai/langgraphjs/commit/f71e00c52600a6dafacccdde1363e83c17c8d97b) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(api): inject langgraph_auth_user on protocol-v2 run.start
+
+  Stamp authenticated user fields onto run config in createOrResumeRun so
+  v2 streaming matches the REST runs API. Shared helpers also dedupe REST
+  run config auth/header enrichment.
+
+- [#2575](https://github.com/langchain-ai/langgraphjs/pull/2575) [`e1b40c2`](https://github.com/langchain-ai/langgraphjs/commit/e1b40c29e14f8e9fb2696acc62d611e14a813f43) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(cli): support node_version 24 in langgraph.json
+
+  Allow Node 24 in the CLI config schema and Docker base image resolution.
+  The langgraphjs-api:24 image is already published from langgraph-api.
+
+- Updated dependencies [[`f71e00c`](https://github.com/langchain-ai/langgraphjs/commit/f71e00c52600a6dafacccdde1363e83c17c8d97b), [`e1b40c2`](https://github.com/langchain-ai/langgraphjs/commit/e1b40c29e14f8e9fb2696acc62d611e14a813f43)]:
+  - @langchain/langgraph-api@1.4.2
+
+## 1.4.1
+
+### Patch Changes
+
+- [#2568](https://github.com/langchain-ai/langgraphjs/pull/2568) [`38d15e2`](https://github.com/langchain-ai/langgraphjs/commit/38d15e2f1f9dded34665a602cd9311cbcf5fbefc) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(langgraph-api): support configurable TypeScript loaders in dev server
+
+  Add `node_loader` to `langgraph.json` (and `LANGGRAPH_NODE_LOADER` env override) so projects using reflect-metadata can use `ts-node` (`--loader ts-node/esm`) instead of the default tsx CLI. Other loaders default to `--import`; only registered shorthands like `ts-node` use `--loader`. `--no-reload` now also disables tsx's internal watch mode. Closes [#1834](https://github.com/langchain-ai/langgraphjs/issues/1834).
+
+- Updated dependencies [[`38d15e2`](https://github.com/langchain-ai/langgraphjs/commit/38d15e2f1f9dded34665a602cd9311cbcf5fbefc)]:
+  - @langchain/langgraph-api@1.4.1
+
+## 1.4.0
+
+### Minor Changes
+
+- [#2559](https://github.com/langchain-ai/langgraphjs/pull/2559) [`48cbdd2`](https://github.com/langchain-ai/langgraphjs/commit/48cbdd23fdf29277530f6aa05c397c9902e81206) Thanks [@christian-bromann](https://github.com/christian-bromann)! - feat(langgraph-cli): add `deploy` command for LangSmith Deployment
+
+  Port the Python CLI's `langgraph deploy` workflow to `@langchain/langgraph-cli`, including local and remote build paths, deployment lifecycle subcommands (`list`, `revisions list`, `delete`, `logs`), and host-backend client utilities with tests.
+
+### Patch Changes
+
+- Updated dependencies [[`48cbdd2`](https://github.com/langchain-ai/langgraphjs/commit/48cbdd23fdf29277530f6aa05c397c9902e81206), [`b1e856d`](https://github.com/langchain-ai/langgraphjs/commit/b1e856d987ac16148dc0872d1fecf70e659ef28e), [`b1e856d`](https://github.com/langchain-ai/langgraphjs/commit/b1e856d987ac16148dc0872d1fecf70e659ef28e)]:
+  - @langchain/langgraph-api@1.4.0
+
+## 1.3.1
+
+### Patch Changes
+
+- [#2527](https://github.com/langchain-ai/langgraphjs/pull/2527) [`9e114e5`](https://github.com/langchain-ai/langgraphjs/commit/9e114e55d362a874878a817740de42fd62ae9db7) Thanks [@christian-bromann](https://github.com/christian-bromann)! - chore(deps): remove uuid dependency in favor of embedded uuid in core
+
+  Replace direct `uuid` package imports with `@langchain/core/utils/uuid` across
+  langgraph packages to deduplicate dependencies and align with @langchain/core's
+  embedded UUID utilities.
+
+- Updated dependencies [[`9e114e5`](https://github.com/langchain-ai/langgraphjs/commit/9e114e55d362a874878a817740de42fd62ae9db7)]:
+  - @langchain/langgraph-api@1.3.1
+
+## 1.3.0
+
+### Patch Changes
+
+- Updated dependencies [[`cad31b4`](https://github.com/langchain-ai/langgraphjs/commit/cad31b42f001a87fcdf57c4c084c655c8762b6a5)]:
+  - @langchain/langgraph-api@1.3.0
+
+## 1.2.5
+
+### Patch Changes
+
+- Updated dependencies [[`658a076`](https://github.com/langchain-ai/langgraphjs/commit/658a076d5b50af9f5b96ab99f26ed629da6e182f)]:
+  - @langchain/langgraph-api@1.2.5
+
+## 1.2.4
+
+### Patch Changes
+
+- [#1925](https://github.com/langchain-ai/langgraphjs/pull/1925) [`6503319`](https://github.com/langchain-ai/langgraphjs/commit/65033191cc3dd671d64dfac78ccdad453fdfbda2) Thanks [@jbrody-nexxa](https://github.com/jbrody-nexxa)! - fix(cli): add --no-reload flag to dev command
+
+- Updated dependencies [[`0125920`](https://github.com/langchain-ai/langgraphjs/commit/0125920a2c4a87dc1d66aaf541ea16146f8cf842)]:
+  - @langchain/langgraph-api@1.2.4
+
+## 1.2.3
+
+### Patch Changes
+
+- [#2443](https://github.com/langchain-ai/langgraphjs/pull/2443) [`80a8c12`](https://github.com/langchain-ai/langgraphjs/commit/80a8c1200a240fd984edc4deb26a7787d08c7532) Thanks [@christian-bromann](https://github.com/christian-bromann)! - refactor(sdk): drop StreamSubmitOptions.command and simplify forkFrom
+
+  Remove the misleading submit({ command }) surface from protocol-v2
+  StreamController; HITL resume is respond() only. Accept forkFrom as a
+  plain checkpoint id string and align protocol-v2 servers and docs.
+
+- Updated dependencies [[`80c2806`](https://github.com/langchain-ai/langgraphjs/commit/80c2806cb2da93745a640664bd0cf603c2361da9), [`80a8c12`](https://github.com/langchain-ai/langgraphjs/commit/80a8c1200a240fd984edc4deb26a7787d08c7532), [`2c14b12`](https://github.com/langchain-ai/langgraphjs/commit/2c14b12a80c306578563e77595943037c7c4844d)]:
+  - @langchain/langgraph-api@1.2.3
+
+## 1.2.2
+
+### Patch Changes
+
+- [#2389](https://github.com/langchain-ai/langgraphjs/pull/2389) [`40bcdab`](https://github.com/langchain-ai/langgraphjs/commit/40bcdab38fa495028d8eba68062e48079dbe9208) Thanks [@jdrogers940](https://github.com/jdrogers940)! - Adding support for pre-release versions in api_version.
+
+- [#2396](https://github.com/langchain-ai/langgraphjs/pull/2396) [`9b20df0`](https://github.com/langchain-ai/langgraphjs/commit/9b20df081a82b79efca3dfd2c128243889b11eb8) Thanks [@hntrl](https://github.com/hntrl)! - fix(langgraph-cli): accept hyphenated prerelease tags in `api_version` values.
+
+- Updated dependencies [[`9b20df0`](https://github.com/langchain-ai/langgraphjs/commit/9b20df081a82b79efca3dfd2c128243889b11eb8)]:
+  - @langchain/langgraph-api@1.2.2
+
+## 1.2.2-rc.0
+
+### Patch Changes
+
+- [#2389](https://github.com/langchain-ai/langgraphjs/pull/2389) [`40bcdab`](https://github.com/langchain-ai/langgraphjs/commit/40bcdab38fa495028d8eba68062e48079dbe9208) Thanks [@jdrogers940](https://github.com/jdrogers940)! - Adding support for pre-release versions in api_version.
+
+- [#2396](https://github.com/langchain-ai/langgraphjs/pull/2396) [`9b20df0`](https://github.com/langchain-ai/langgraphjs/commit/9b20df081a82b79efca3dfd2c128243889b11eb8) Thanks [@hntrl](https://github.com/hntrl)! - fix(langgraph-cli): accept hyphenated prerelease tags in `api_version` values.
+
+- Updated dependencies [[`9b20df0`](https://github.com/langchain-ai/langgraphjs/commit/9b20df081a82b79efca3dfd2c128243889b11eb8)]:
+  - @langchain/langgraph-api@1.2.2-rc.0
+
+## 1.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`2bb66bf`](https://github.com/langchain-ai/langgraphjs/commit/2bb66bf816a8b18b2968ed885ef2df15f684cb4e)]:
+  - @langchain/langgraph-api@1.2.1
+
+## 1.2.0
+
+### Patch Changes
+
+- Updated dependencies [[`085a07f`](https://github.com/langchain-ai/langgraphjs/commit/085a07f569b6d7d79728eb7eb6eb3a0c67fcdefb)]:
+  - @langchain/langgraph-api@1.2.0
+
+## 1.1.17
+
+### Patch Changes
+
+- [#2247](https://github.com/langchain-ai/langgraphjs/pull/2247) [`9874420`](https://github.com/langchain-ai/langgraphjs/commit/9874420019199a7064501b53b9407bd23dc752f9) Thanks [@jdrogers940](https://github.com/jdrogers940)! - Respect when http config is set. Also don't log an error when .env file is missing.
+
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.1.17
+
+## 1.1.16
+
+### Patch Changes
+
+- [#2183](https://github.com/langchain-ai/langgraphjs/pull/2183) [`ad266cf`](https://github.com/langchain-ai/langgraphjs/commit/ad266cf29fc42000485aa77b6142f5729bc17c82) Thanks [@christian-bromann](https://github.com/christian-bromann)! - fix(cli): allow --config to point to any config file
+
+- Updated dependencies []:
+  - @langchain/langgraph-api@1.1.16
+
+## 1.1.15
+
+### Patch Changes
+
+- Updated dependencies [[`730b82d`](https://github.com/langchain-ai/langgraphjs/commit/730b82d2309e65e6b2ed99ebff2aa052cff8ed35)]:
+  - @langchain/langgraph-api@1.1.15
+
+## 1.1.14
+
+### Patch Changes
+
+- Updated dependencies [[`aa8e878`](https://github.com/langchain-ai/langgraphjs/commit/aa8e878e5b71128685ab7e7a79c96bd2519c0123)]:
+  - @langchain/langgraph-api@1.1.14
+
+## 2.0.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @langchain/langgraph-api@2.0.0
+
+## 1.1.13
+
+### Patch Changes
+
+- [#1954](https://github.com/langchain-ai/langgraphjs/pull/1954) [`632d39f`](https://github.com/langchain-ai/langgraphjs/commit/632d39f5a1c6d0f838e48e5e59e580d5a82faa94) Thanks [@hinthornw](https://github.com/hinthornw)! - Support `api_version` field in `langgraph.json` to control the base Docker image tag. When set, the image tag becomes `{api_version}-node{node_version}` (e.g., `langchain/langgraphjs-api:0.7.29-node22`) instead of just `{node_version}`.
+
+- Updated dependencies [[`4ebe31e`](https://github.com/langchain-ai/langgraphjs/commit/4ebe31ec6ea289f2eeff324fb1875af869d543c9)]:
+  - @langchain/langgraph-api@1.1.13
+
+## 1.1.12
+
+### Patch Changes
+
+- Updated dependencies [[`ad39dcf`](https://github.com/langchain-ai/langgraphjs/commit/ad39dcfddf575a5e5438cd40b284ac0d549b5827)]:
+  - @langchain/langgraph-api@1.1.12
+
+## 1.1.11
+
+### Patch Changes
+
+- Updated dependencies [[`2b9f3ee`](https://github.com/langchain-ai/langgraphjs/commit/2b9f3ee83d0b8ba023e7a52b938260af3f6433d4)]:
+  - @langchain/langgraph-api@1.1.11
+
+## 1.1.10
+
+### Patch Changes
+
+- Updated dependencies [[`e7aeffe`](https://github.com/langchain-ai/langgraphjs/commit/e7aeffeb72aaccd8c94f8e78708f747ce21bf23c), [`e7aeffe`](https://github.com/langchain-ai/langgraphjs/commit/e7aeffeb72aaccd8c94f8e78708f747ce21bf23c)]:
+  - @langchain/langgraph-api@1.1.10
+  - create-langgraph@1.1.5
+
+## 1.1.9
+
+### Patch Changes
+
+- Updated dependencies [[`a9fa28b`](https://github.com/langchain-ai/langgraphjs/commit/a9fa28b6adad16050fcf5d5876a3924253664217), [`a9fa28b`](https://github.com/langchain-ai/langgraphjs/commit/a9fa28b6adad16050fcf5d5876a3924253664217)]:
+  - @langchain/langgraph-api@1.1.9
+  - create-langgraph@1.1.4
+
+## 1.1.8
+
+### Patch Changes
+
+- Updated dependencies [[`a84c1ff`](https://github.com/langchain-ai/langgraphjs/commit/a84c1ff18289653ff4715bd0db4ac3d06600556e), [`a84c1ff`](https://github.com/langchain-ai/langgraphjs/commit/a84c1ff18289653ff4715bd0db4ac3d06600556e)]:
+  - @langchain/langgraph-api@1.1.8
+  - create-langgraph@1.1.3
+
+## 1.1.7
+
+### Patch Changes
+
+- Updated dependencies [[`e9f7e8e`](https://github.com/langchain-ai/langgraphjs/commit/e9f7e8e9e6b8851cb7dd68e31d2f1867b62bd6bd), [`e9f7e8e`](https://github.com/langchain-ai/langgraphjs/commit/e9f7e8e9e6b8851cb7dd68e31d2f1867b62bd6bd)]:
+  - @langchain/langgraph-api@1.1.7
+  - create-langgraph@1.1.2
+
+## 1.1.6
+
+### Patch Changes
+
+- Updated dependencies [3ec85a4]
+- Updated dependencies [3ec85a4]
+  - @langchain/langgraph-api@1.1.6
+  - create-langgraph@1.1.1
+
+## 1.1.5
+
+### Patch Changes
+
+- Updated dependencies [3613386]
+  - @langchain/langgraph-api@1.1.5
+
+## 1.1.4
+
+### Patch Changes
+
+- Updated dependencies [730dc7c]
+  - @langchain/langgraph-api@1.1.4
+
+## 1.1.3
+
+### Patch Changes
+
+- Updated dependencies [074da7f]
+  - create-langgraph@1.1.0
+  - @langchain/langgraph-api@1.1.3
+
+## 1.1.2
+
+### Patch Changes
+
+- Updated dependencies [d08e484]
+  - @langchain/langgraph-api@1.1.2
+
+## 1.1.1
+
+### Patch Changes
+
+- Updated dependencies [35e8fc7]
+  - @langchain/langgraph-api@1.1.1
+
+## 1.1.0
+
+### Minor Changes
+
+- c71b92b: Updated the uv version to latest 0.9.11. Fixed error fixed EXDEV: cross-device link when using Python adapter
+
+### Patch Changes
+
+- @langchain/langgraph-api@1.1.0
+
+## 1.0.4
+
+### Patch Changes
+
+- Updated dependencies [b9be526]
+  - @langchain/langgraph-api@1.0.4
+
+## 1.0.3
+
+### Patch Changes
+
+- 6cd8ecb: Remove Zod 3.x dependency constraint to allow Zod 4.x and avoid installing duplicate Zod packages
+- Updated dependencies [6cd8ecb]
+  - @langchain/langgraph-api@1.0.3
+
+## 1.0.2
+
+### Patch Changes
+
+- Updated dependencies [ebe5ae7]
+  - @langchain/langgraph-api@1.0.2
+
+## 1.0.1
+
+### Patch Changes
+
+- Updated dependencies [610e1e1]
+  - @langchain/langgraph-api@1.0.1
+
+## 1.0.0
+
+### Major Changes
+
+- 1e1ecbb: This release updates the package for compatibility with LangGraph v1.0. See the [v1.0 release notes](https://docs.langchain.com/oss/javascript/releases/langgraph-v1) for details on what's new.
+
+### Patch Changes
+
+- Updated dependencies [1e1ecbb]
+  - create-langgraph@1.0.0
+  - @langchain/langgraph-api@1.0.0
+
+## 0.0.71
+
+### Patch Changes
+
+- Updated dependencies [f5865ac]
+  - @langchain/langgraph-api@0.0.71
+
+## 0.0.70
+
+### Patch Changes
+
+- Updated dependencies [636e142]
+  - @langchain/langgraph-api@0.0.70
+
+## 0.0.69
+
+### Patch Changes
+
+- Updated dependencies [f2aa533]
+  - @langchain/langgraph-api@0.0.69
+
+## 0.0.68
+
+### Patch Changes
+
+- 7770c6a: Add `new` command to `@langchain/langgraph-cli` CLI
+- Updated dependencies [7770c6a]
+  - create-langgraph@0.0.4
+  - @langchain/langgraph-api@0.0.68
+
+## 0.0.67
+
+### Patch Changes
+
+- Updated dependencies [e23fa7f]
+  - @langchain/langgraph-api@0.0.67
+
+## 0.0.66
+
+### Patch Changes
+
+- Updated dependencies [5176f1c]
+- Updated dependencies [68a1aa8]
+  - @langchain/langgraph-api@0.0.66
+
+## 0.0.65
+
+### Patch Changes
+
+- Updated dependencies [0aefafe]
+  - @langchain/langgraph-api@0.0.65
+
+## 0.0.64
+
+### Patch Changes
+
+- Updated dependencies [30bcfcd]
+- Updated dependencies [572de43]
+  - @langchain/langgraph-api@0.0.64
+
+## 0.0.63
+
+### Patch Changes
+
+- Updated dependencies [c9d4dfd]
+  - @langchain/langgraph-api@0.0.63
+
+## 0.0.62
+
+### Patch Changes
+
+- Updated dependencies [c868796]
+  - @langchain/langgraph-api@0.0.62
+
+## 0.0.61
+
+### Patch Changes
+
+- Updated dependencies [a334897]
+- Updated dependencies [9357bb7]
+- Updated dependencies [9f13d74]
+  - @langchain/langgraph-api@0.0.61
+
+## 0.0.60
+
+### Patch Changes
+
+- Updated dependencies [9c57526]
+  - @langchain/langgraph-api@0.0.60
+
+## 0.0.59
+
+### Patch Changes
+
+- d28a9d7: fix(cli): sysinfo command failing to obtain dep versions for Node.js 20.x
+- Updated dependencies [3412f9f]
+  - @langchain/langgraph-api@0.0.59
+
+## 0.0.58
+
+### Patch Changes
+
+- Updated dependencies [f65f619]
+- Updated dependencies [c857357]
+  - @langchain/langgraph-api@0.0.58
+
+## 0.0.57
+
+### Patch Changes
+
+- 31cc9f7: support description property for `langgraph.json`
+- 679a1be: Fix sysinfo command for PNPM
+- 2f179e5: feat(cli): accept BROWSER=none to prevent spawning a browser
+- Updated dependencies [31cc9f7]
+  - @langchain/langgraph-api@0.0.57
+
+## 0.0.56
+
+### Patch Changes
+
+- Updated dependencies [3c390c9]
+  - @langchain/langgraph-api@0.0.56
+
+## 0.0.55
+
+### Patch Changes
+
+- Updated dependencies [ef84039]
+- Updated dependencies [7edf347]
+- Updated dependencies [77b21d5]
+  - @langchain/langgraph-api@0.0.55
+
+## 0.0.54
+
+### Patch Changes
+
+- Updated dependencies [1777878]
+  - @langchain/langgraph-api@0.0.54
+
+## 0.0.53
+
+### Patch Changes
+
+- Updated dependencies [f1bcec7]
+  - @langchain/langgraph-api@0.0.53
+
+## 0.0.52
+
+### Patch Changes
+
+- Updated dependencies [030698f]
+  - @langchain/langgraph-api@0.0.52
+
+## 0.0.51
+
+### Patch Changes
+
+- 11319f7: fix(cli): allow node_version: 22 when pulling and building image
+  - @langchain/langgraph-api@0.0.51
+
+## 0.0.50
+
+### Patch Changes
+
+- 337b419: fix(cli): enable correct passthrough of docker build args
+  - @langchain/langgraph-api@0.0.50
+
+## 0.0.49
+
+### Patch Changes
+
+- 78a15a1: feat(cli): add sysinfo command to obtain actual version
+- Updated dependencies [ee1defa]
+  - @langchain/langgraph-api@0.0.49
+
+## 0.0.48
+
+### Patch Changes
+
+- ac7b067: fix(sdk): use `kind` when checking for Studio user
+- Updated dependencies [ac7b067]
+  - @langchain/langgraph-api@0.0.48
+
+## 0.0.47
+
+### Patch Changes
+
+- 39cc88f: Fix apply namespace to messages-tuple stream mode
+- c1ddda1: Embed methods for obtaining state should use `getGraph(...)`
+- Updated dependencies [39cc88f]
+- Updated dependencies [c1ddda1]
+  - @langchain/langgraph-api@0.0.47
+
+## 0.0.46
+
+### Patch Changes
+
+- d172de3: Fix apply namespace to messages-tuple stream mode
+- Updated dependencies [d172de3]
+  - @langchain/langgraph-api@0.0.46
+
+## 0.0.45
+
+### Patch Changes
+
+- 603daa6: Embed should properly handle `payload.checkpoint` and `payload.checkpoint_id`
+- Updated dependencies [603daa6]
+  - @langchain/langgraph-api@0.0.45
+
+## 0.0.44
+
+### Patch Changes
+
+- 2f26f2f: Expose get/delete thread endpoint to embed server
+- Updated dependencies [2f26f2f]
+  - @langchain/langgraph-api@0.0.44
+
+## 0.0.43
+
+### Patch Changes
+
+- ce0a39a: Fix invalid package.json dependencies
+- Updated dependencies [ce0a39a]
+  - @langchain/langgraph-api@0.0.43
+
+## 0.0.42
+
+### Patch Changes
+
+- 972b66a: Support gen UI components namespaced with a hyphen
+- Updated dependencies [972b66a]
+  - @langchain/langgraph-api@0.0.42

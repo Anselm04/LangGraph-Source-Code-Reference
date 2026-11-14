@@ -1,0 +1,2443 @@
+import type { RunnableConfig } from "@langchain/core/runnables";
+import type { CallbackManagerForChainRun } from "@langchain/core/callbacks/manager";
+import {
+  BaseMessage,
+  type BaseMessageLike,
+  coerceMessageLikeToMessage,
+} from "@langchain/core/messages";
+import { v4 as uuidv4 } from "@langchain/core/utils/uuid";
+import {
+  BaseCheckpointSaver,
+  Checkpoint,
+  CheckpointTuple,
+  copyCheckpoint,
+  emptyCheckpoint,
+  PendingWrite,
+  CheckpointPendingWrite,
+  CheckpointMetadata,
+  All,
+  BaseStore,
+  AsyncBatchedStore,
+  WRITES_IDX_MAP,
+  BaseCache,
+  CacheFullKey,
+  CacheNamespace,
+  uuid5,
+} from "@langchain/langgraph-checkpoint";
+
+import {
+  BaseChannel,
+  createCheckpoint,
+  channelsFromCheckpoint,
+  DELTA_WRITES_VERSIONED,
+  deltaChannelsToSnapshot,
+  deltaChannelWrites,
+  deltaChannelsWithPendingWrites,
+  exitDeltaLateTaskId,
+  exitDeltaTaskId,
+  isDeltaChannel,
+  isDeltaWritesVersioned,
+} from "../channels/base.js";
+import type { DeltaChannel } from "../channels/delta.js";
+import { isMessagesDeltaReducer } from "../graph/messages_reducer.js";
+import { advanceDeltaCounters, checkpointSuperseded } from "./checkpoint.js";
+import type {
+  Call,
+  CallTaskPath,
+  Durability,
+  PregelExecutableTask,
+  PregelScratchpad,
+  StreamMode,
+} from "./types.js";
+import {
+  isCommand,
+  _isSend,
+  _getOverwriteValue,
+  _isOverwriteValue,
+  Overwrite,
+  CHECKPOINT_NAMESPACE_SEPARATOR,
+  Command,
+  CONFIG_KEY_CHECKPOINT_MAP,
+  CONFIG_KEY_READ,
+  CONFIG_KEY_RESUMING,
+  CONFIG_KEY_STREAM,
+  ERROR,
+  ERROR_SOURCE_NODE,
+  INPUT,
+  INTERRUPT,
+  isTaskOutput,
+  NULL_TASK_ID,
+  RESUME,
+  TAG_HIDDEN,
+  TASKS,
+  PUSH,
+  CONFIG_KEY_SCRATCHPAD,
+  CONFIG_KEY_CHECKPOINT_NS,
+  CHECKPOINT_NAMESPACE_END,
+  CONFIG_KEY_CHECKPOINT_ID,
+  CONFIG_KEY_RESUME_MAP,
+  CONFIG_KEY_REPLAY_STATE,
+  CONFIG_KEY_STRICT_RESUME,
+  START,
+  type Interrupt,
+} from "../constants.js";
+import { ReplayState } from "./replay.js";
+import {
+  _applyWrites,
+  _prepareNextTasks,
+  _prepareNodeErrorHandlerTask,
+  _prepareSingleTask,
+  increment,
+  shouldInterrupt,
+  sanitizeUntrackedValuesInSend,
+  taskPathStr,
+  WritesProtocol,
+} from "./algo.js";
+import {
+  gatherIterator,
+  gatherIteratorSync,
+  prefixGenerator,
+} from "../utils.js";
+import {
+  mapCommand,
+  mapInput,
+  mapOutputUpdates,
+  mapOutputValues,
+  readChannels,
+} from "./io.js";
+import {
+  EmptyInputError,
+  GraphInterrupt,
+  isGraphInterrupt,
+  UnknownInterruptError,
+} from "../errors.js";
+import { getNewChannelVersions, patchConfigurable } from "./utils/index.js";
+import {
+  mapDebugTasks,
+  mapDebugCheckpoint,
+  mapDebugTaskResults,
+  printStepTasks,
+} from "./debug.js";
+import { PregelNode } from "./read.js";
+import { LangGraphRunnableConfig } from "./runnable_types.js";
+import type { RunControl } from "./runtime.js";
+import {
+  createDuplexStream,
+  IterableReadableWritableStream,
+  StreamChunkMeta,
+} from "./stream.js";
+import { isXXH3 } from "../hash.js";
+import type {
+  GraphLifecycleEvent,
+  GraphLifecycleStatus,
+} from "../callbacks.js";
+
+const INPUT_DONE = Symbol.for("INPUT_DONE");
+const INPUT_RESUMING = Symbol.for("INPUT_RESUMING");
+const DEFAULT_LOOP_LIMIT = 25;
+
+/**
+ * Give the messages written to DeltaChannels stable ids, and return the writes
+ * in `writes` that go to a DeltaChannel.
+ *
+ * A DeltaChannel replays its saved writes on every read, and its reducer may
+ * not assign missing ids (`messagesDeltaReducer` doesn't), so a message saved
+ * without an id comes back without one, or with a new one on every read, and
+ * nothing can target it by id, for example `RemoveMessage`.
+ *
+ * In a channel whose reducer is {@link messagesDeltaReducer}, every
+ * message-like it accepts (a message, a plain object, a string, a
+ * `[role, content]` pair; alone, in an array or in an `Overwrite`) gets an id.
+ * A plain message object stays plain, with the id on a copy, except in an
+ * `Overwrite`, whose value the channel keeps as it is, so there it becomes a
+ * message. Other DeltaChannels may hold other data, so there only message
+ * objects get ids. Anything that can't become a message is left as it is, so
+ * it fails where it always has, when the reducer reads it.
+ *
+ * A write that changes is replaced in `writes` by a new `[channel, value]`
+ * pair: arrays and pairs the caller passed in are never changed, only the ids
+ * of message objects.
+ */
+export function ensureDeltaMessageIds<W extends [PropertyKey, unknown]>(
+  channels: Record<string, BaseChannel>,
+  writes: W[]
+): W[] {
+  const deltaWrites: W[] = [];
+  for (let i = 0; i < writes.length; i += 1) {
+    const [channelName, value] = writes[i];
+    const channel = channels[String(channelName)];
+    if (!isDeltaChannel(channel)) continue;
+    if (isMessagesDeltaReducer((channel as DeltaChannel<unknown>).reducer)) {
+      const newValue = withMessageIds(value);
+      if (newValue !== value) writes[i] = [channelName, newValue] as W;
+    } else {
+      stampMessageIds(value);
+    }
+    deltaWrites.push(writes[i]);
+  }
+  return deltaWrites;
+}
+
+function withMessageIds(value: unknown): unknown {
+  const [isOverwrite, overwriteValue] = _getOverwriteValue<unknown>(value);
+  if (!isOverwrite) {
+    return Array.isArray(value)
+      ? mapItems(value, writtenMessageWithId)
+      : writtenMessageWithId(value);
+  }
+  if (!Array.isArray(overwriteValue)) return value;
+  const items = mapItems(overwriteValue, messageWithId);
+  return items === overwriteValue ? value : new Overwrite(items);
+}
+
+function mapItems(items: unknown[], fn: (item: unknown) => unknown): unknown[] {
+  const mapped = items.map(fn);
+  return mapped.every((item, i) => item === items[i]) ? items : mapped;
+}
+
+function writtenMessageWithId(item: unknown): unknown {
+  if (!isPlainObject(item)) return messageWithId(item);
+  // A plain message object stays plain: it's smaller to save and faster to
+  // replay, and the reducer makes the same message from it.
+  try {
+    if (coerceMessageLikeToMessage(item as BaseMessageLike).id) return item;
+  } catch {
+    return item;
+  }
+  return { ...item, id: uuidv4() };
+}
+
+function messageWithId(item: unknown): unknown {
+  if (BaseMessage.isInstance(item)) {
+    stampMessageIds(item);
+    return item;
+  }
+  let message: BaseMessage;
+  try {
+    message = coerceMessageLikeToMessage(item as BaseMessageLike);
+  } catch {
+    return item;
+  }
+  if (!message.id) setMessageId(message);
+  return message;
+}
+
+function isPlainObject(item: unknown): item is Record<string, unknown> {
+  if (typeof item !== "object" || item === null) return false;
+  const proto = Object.getPrototypeOf(item);
+  return (proto === Object.prototype || proto === null) && !("lc" in item);
+}
+
+function stampMessageIds(value: unknown): void {
+  if (BaseMessage.isInstance(value)) {
+    if (value.id == null) setMessageId(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) stampMessageIds(item);
+    return;
+  }
+  const [isOverwrite, overwriteValue] = _getOverwriteValue<unknown>(value);
+  if (isOverwrite) stampMessageIds(overwriteValue);
+}
+
+function setMessageId(message: BaseMessage): void {
+  message.id = uuidv4();
+  if (message.lc_kwargs != null) message.lc_kwargs.id = message.id;
+}
+
+export type PregelLoopInitializeParams = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  input?: any | Command;
+  config: RunnableConfig;
+  checkpointer?: BaseCheckpointSaver;
+  outputKeys: string | string[];
+  streamKeys: string | string[];
+  nodes: Record<string, PregelNode>;
+  channelSpecs: Record<string, BaseChannel>;
+  stream: IterableReadableWritableStream;
+  store?: BaseStore;
+  cache?: BaseCache<PendingWrite<string>[]>;
+  interruptAfter: string[] | All;
+  interruptBefore: string[] | All;
+  durability: Durability;
+  manager?: CallbackManagerForChainRun;
+  hasGraphCallbacks?: boolean;
+  debug: boolean;
+  triggerToNodes: Record<string, string[]>;
+};
+
+type PregelLoopParams = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  input?: any | Command;
+  config: RunnableConfig;
+  checkpointer?: BaseCheckpointSaver;
+  checkpoint: Checkpoint;
+  checkpointMetadata: CheckpointMetadata;
+  checkpointPreviousVersions: Record<string, string | number>;
+  checkpointPendingWrites: CheckpointPendingWrite[];
+  checkpointConfig: RunnableConfig;
+  channels: Record<string, BaseChannel>;
+  step: number;
+  stop: number;
+  outputKeys: string | string[];
+  streamKeys: string | string[];
+  nodes: Record<string, PregelNode>;
+  checkpointNamespace: string[];
+  addressed: boolean;
+  isNested: boolean;
+  resumeAtHead: boolean;
+  addressedCheckpointSuperseded: boolean;
+  manager?: CallbackManagerForChainRun;
+  hasGraphCallbacks?: boolean;
+  stream: IterableReadableWritableStream;
+  store?: AsyncBatchedStore;
+  cache?: BaseCache<PendingWrite<string>[]>;
+  prevCheckpointConfig: RunnableConfig | undefined;
+  interruptAfter: string[] | All;
+  interruptBefore: string[] | All;
+  durability: Durability;
+  debug: boolean;
+  triggerToNodes: Record<string, string[]>;
+  hasPersistedParent?: boolean;
+  loadedLatest?: boolean;
+  deltaWritesVersioned?: boolean;
+};
+
+/**
+ * Split a serialized checkpoint namespace into its path segments.
+ *
+ * Checkpoint namespaces are stored as a single string whose nested levels are
+ * joined by {@link CHECKPOINT_NAMESPACE_SEPARATOR} (e.g. `"parent|child"`).
+ * The root namespace — represented as `undefined` or the empty string — maps
+ * to an empty array.
+ *
+ * @param ns - The serialized checkpoint namespace, or `undefined`.
+ * @returns The namespace as an array of path segments (`[]` for the root).
+ */
+function checkpointNamespaceFromNs(ns: string | undefined): string[] {
+  if (ns === undefined || ns === "") return [];
+  return ns.split(CHECKPOINT_NAMESPACE_SEPARATOR);
+}
+
+/**
+ * Find the most deeply nested namespace recorded in a checkpoint map.
+ *
+ * The checkpoint map ({@link CONFIG_KEY_CHECKPOINT_MAP}) associates every
+ * namespace seen on a thread with its checkpoint id. Because nested namespaces
+ * are built by appending segments to their parent, a deeper namespace always
+ * yields a longer key — so the longest non-empty key is the deepest one.
+ *
+ * Used by the loop's `#interruptStreamNamespace()` during subgraph
+ * time-travel: interrupt events must be emitted against the active (deepest)
+ * subgraph namespace rather than the root graph.
+ *
+ * @param map - The checkpoint map (namespace -> checkpoint id), or `undefined`.
+ * @returns The deepest namespace as path segments, or `[]` when the map is
+ *   absent, empty, or only contains the root namespace.
+ */
+function deepestCheckpointMapNamespace(
+  map: Record<string, string> | undefined
+): string[] {
+  if (!map) return [];
+  let deepest = "";
+  for (const key of Object.keys(map)) {
+    if (key !== "" && key.length > deepest.length) {
+      deepest = key;
+    }
+  }
+  return checkpointNamespaceFromNs(deepest);
+}
+
+class AsyncBatchedCache extends BaseCache<PendingWrite<string>[]> {
+  protected cache: BaseCache<PendingWrite<string>[]>;
+
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(cache: BaseCache<unknown>) {
+    super();
+    this.cache = cache as BaseCache<PendingWrite<string>[]>;
+  }
+
+  async get(keys: CacheFullKey[]) {
+    return this.enqueueOperation("get", keys);
+  }
+
+  async set(
+    pairs: {
+      key: CacheFullKey;
+      value: PendingWrite<string>[];
+      ttl?: number;
+    }[]
+  ) {
+    return this.enqueueOperation("set", pairs);
+  }
+
+  async clear(namespaces: CacheNamespace[]) {
+    return this.enqueueOperation("clear", namespaces);
+  }
+
+  async stop() {
+    await this.queue;
+  }
+
+  private enqueueOperation<Type extends "get" | "set" | "clear">(
+    type: Type,
+    ...args: Parameters<(typeof this.cache)[Type]>
+  ) {
+    const newPromise = this.queue.then(() => {
+      // @ts-expect-error Tuple type warning
+      return this.cache[type](...args) as Promise<
+        ReturnType<(typeof this.cache)[Type]>
+      >;
+    });
+
+    this.queue = newPromise.then(
+      () => void 0,
+      () => void 0
+    );
+
+    return newPromise;
+  }
+}
+
+export class PregelLoop {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  protected input?: any | Command;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  output: any;
+
+  config: LangGraphRunnableConfig;
+
+  protected checkpointer?: BaseCheckpointSaver;
+
+  protected checkpointerGetNextVersion: (current: number | undefined) => number;
+
+  channels: Record<string, BaseChannel>;
+
+  // Channel kinds are fixed for a run, so they are looked up once here
+  // instead of scanning every channel on each task and step.
+  protected deltaChannels: Record<string, BaseChannel>;
+
+  protected hasUntrackedChannels: boolean;
+
+  protected checkpoint: Checkpoint;
+
+  protected checkpointIdSaved: string | undefined;
+
+  /**
+   * Exit-mode accumulator of DeltaChannel writes across the whole run, as
+   * `[step, taskId, taskPath, channel, value]` — see `_putExitDeltaWrites`
+   * for how they are ordered. `undefined` outside "exit" durability.
+   */
+  protected _exitDeltaWrites:
+    | [number, string, string, string, unknown][]
+    | undefined;
+
+  /**
+   * The `(taskId, channel)` pairs whose delta writes are stored on the loaded
+   * checkpoint, which a resume addressed by `checkpoint_id` can rerun.
+   * Captured in the constructor, before this run's Command processing adds
+   * writes (mirrors Python's `_first`). Used by the exit-mode accumulator to
+   * skip the loaded writes on the first superstep — they are already stored
+   * on the checkpoint.
+   */
+  protected _storedDeltaWrites: Set<string> = new Set();
+
+  /**
+   * This run's `Command` delta writes (`NULL_TASK_ID`), kept apart from the
+   * `NULL_TASK_ID` writes loaded with the checkpoint, which the first
+   * superstep skips. Written by the input handler; replayed into the
+   * exit-mode accumulator at the first superstep.
+   */
+  protected _exitCommandWrites: [string, unknown][] = [];
+
+  /**
+   * The step of the first superstep this run completed (the loaded
+   * checkpoint's own), or `null` before it ticks. The exit-mode accumulator
+   * keeps that superstep's real task paths so its writes interleave with the
+   * loaded ones as live execution did; later supersteps get `~~`-prefixed
+   * synthetic paths (see `_putExitDeltaWrites`).
+   */
+  protected _exitFirstStep: number | null = null;
+
+  /**
+   * DeltaChannels that must snapshot at the next checkpoint, whatever their
+   * cadence counters say:
+   * - an Overwrite arrived since the last checkpoint, so sparse replay has to
+   *   start from the post-overwrite value;
+   * - the checkpoint this run starts from has pending writes to them; see
+   *   {@link deltaChannelsWithPendingWrites}.
+   * Cleared once the channel snapshots.
+   */
+  protected _deltaChannelsForcedSnapshot: Set<string> = new Set();
+
+  /**
+   * Set by `_first` for a resume: the writes it loaded with the checkpoint,
+   * which the end of the superstep checks against the ones handed back to
+   * their tasks.
+   */
+  protected _resumeLoadedWrites: CheckpointPendingWrite[] = [];
+
+  /** Tasks a resume handed loaded writes back to. */
+  protected _reappliedTaskIds: Set<string> = new Set();
+
+  /** Tasks that wrote during this run, the only ones exit mode saves at exit. */
+  protected _writtenTaskIds: Set<string> = new Set();
+
+  /**
+   * A checkpoint addressed by `checkpoint_id` that the thread has moved past,
+   * so it may already have children.
+   */
+  protected addressedCheckpointSuperseded: boolean;
+
+  /** Whether a real checkpoint was loaded from the saver at initialization. */
+  protected _hasPersistedParent = false;
+
+  /**
+   * Whether initialization loaded the thread's latest checkpoint, not one a
+   * `checkpoint_id` addressed, so nothing has been built on it yet.
+   */
+  protected _loadedLatest = false;
+
+  /**
+   * Whether this branch carries {@link DELTA_WRITES_VERSIONED}: a graph with
+   * a DeltaChannel on a new thread, or a loaded checkpoint that has it. Every
+   * checkpoint this loop writes inherits it.
+   */
+  protected _deltaWritesVersioned = false;
+
+  /** The checkpointConfig as captured at initialization (anchor for exit writes). */
+  protected _initialCheckpointConfig: RunnableConfig | undefined;
+
+  protected checkpointConfig: RunnableConfig;
+
+  checkpointMetadata: CheckpointMetadata;
+
+  protected checkpointNamespace: string[];
+
+  protected checkpointPendingWrites: CheckpointPendingWrite[] = [];
+
+  protected checkpointPreviousVersions: Record<string, string | number>;
+
+  step: number;
+
+  protected stop: number;
+
+  protected durability: Durability;
+
+  protected outputKeys: string | string[];
+
+  protected streamKeys: string | string[];
+
+  protected nodes: Record<string, PregelNode>;
+
+  /** Whether the run points this loop at a checkpoint. */
+  protected addressed: boolean;
+
+  protected skipDoneTasks = true;
+
+  protected prevCheckpointConfig: RunnableConfig | undefined;
+
+  protected updatedChannels: Set<string> | undefined;
+
+  status: GraphLifecycleStatus = "pending";
+
+  lifecycleEvents?: GraphLifecycleEvent[];
+
+  /**
+   * Run-scoped control surface for cooperative draining. Populated from the
+   * run config. When `control.drainRequested` is true, the loop stops at the
+   * next superstep boundary instead of dispatching more tasks.
+   */
+  control?: RunControl;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tasks: Record<string, PregelExecutableTask<any, any>> = {};
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  stream: IterableReadableWritableStream;
+
+  checkpointerPromises: Set<Promise<unknown>> = new Set();
+
+  isNested: boolean;
+
+  /** True when an explicit checkpoint_id targets the latest saved checkpoint. */
+  protected resumeAtHead: boolean;
+
+  protected _checkpointerChainedPromise: Promise<unknown> = Promise.resolve();
+
+  /**
+   * The DeltaChannel writes this loop sent to the saver since the last
+   * checkpoint save was scheduled. That save waits for them, and a rejection
+   * skips it and every later save: a DeltaChannel is rebuilt from its writes
+   * along the parent chain, so a checkpoint saved past a missing write or
+   * parent reads back short for good.
+   */
+  protected _pendingDeltaWrites: Promise<unknown>[] = [];
+
+  /**
+   * Track a checkpointer promise, removing it from the set on success.
+   * Failed promises are kept so that Promise.all() in the finally block
+   * of _streamIterator can surface the error.
+   *
+   * @internal
+   */
+  protected _trackCheckpointerPromise(promise: Promise<unknown>) {
+    const tracked = promise.then(
+      (value) => {
+        this.checkpointerPromises.delete(tracked);
+        return value;
+      },
+      (error) => {
+        // Keep failed promises in the set so errors surface via Promise.all()
+        throw error;
+      }
+    );
+    // Nothing awaits the tracked promise until a barrier awaits the set, so a
+    // write that rejects before then would be reported by the runtime as an
+    // unhandled rejection. Mark it handled here; the barrier's Promise.all()
+    // still receives the rejection.
+    tracked.catch(() => {});
+    this.checkpointerPromises.add(tracked);
+  }
+
+  /**
+   * Wait for persistence work scheduled by this run up to this point.
+   *
+   * Taking a snapshot keeps the barrier scoped to the completed superstep:
+   * persistence scheduled later cannot extend it, while failures from the
+   * captured work are propagated at the superstep boundary.
+   */
+  protected async _awaitCheckpointerPromises(): Promise<void> {
+    await Promise.all([...this.checkpointerPromises]);
+  }
+
+  store?: AsyncBatchedStore;
+
+  cache?: AsyncBatchedCache;
+
+  manager?: CallbackManagerForChainRun;
+
+  interruptAfter: string[] | All;
+
+  interruptBefore: string[] | All;
+
+  toInterrupt: PregelExecutableTask<string, string>[] = [];
+
+  debug: boolean = false;
+
+  triggerToNodes: Record<string, string[]>;
+
+  get isResuming() {
+    let hasChannelVersions = false;
+    if (START in this.checkpoint.channel_versions) {
+      // For common channels, we can short-circuit the check
+      hasChannelVersions = true;
+    } else {
+      for (const chan in this.checkpoint.channel_versions) {
+        if (
+          Object.prototype.hasOwnProperty.call(
+            this.checkpoint.channel_versions,
+            chan
+          )
+        ) {
+          hasChannelVersions = true;
+          break;
+        }
+      }
+    }
+
+    const configHasResumingFlag =
+      this.config.configurable?.[CONFIG_KEY_RESUMING] !== undefined;
+    const configIsResuming =
+      configHasResumingFlag && this.config.configurable?.[CONFIG_KEY_RESUMING];
+
+    const inputIsNullOrUndefined =
+      this.input === null || this.input === undefined;
+    const inputIsCommandResuming =
+      isCommand(this.input) && this.input.resume != null;
+    const inputIsResuming = this.input === INPUT_RESUMING;
+
+    const runIdMatchesPrevious =
+      !this.isNested &&
+      this.config.metadata?.run_id !== undefined &&
+      (this.checkpointMetadata as { run_id?: unknown })?.run_id !== undefined &&
+      this.config.metadata.run_id ===
+        (this.checkpointMetadata as { run_id?: unknown })?.run_id;
+
+    return (
+      hasChannelVersions &&
+      (configIsResuming ||
+        inputIsNullOrUndefined ||
+        inputIsCommandResuming ||
+        inputIsResuming ||
+        runIdMatchesPrevious)
+    );
+  }
+
+  get isReplaying(): boolean {
+    return !this.skipDoneTasks;
+  }
+
+  constructor(params: PregelLoopParams) {
+    this.input = params.input;
+    this.checkpointer = params.checkpointer;
+    // TODO: if managed values no longer needs graph we can replace with
+    // managed_specs, channel_specs
+    if (this.checkpointer !== undefined) {
+      this.checkpointerGetNextVersion = this.checkpointer.getNextVersion.bind(
+        this.checkpointer
+      );
+    } else {
+      this.checkpointerGetNextVersion = increment;
+    }
+    this.checkpoint = params.checkpoint;
+    this.checkpointMetadata = params.checkpointMetadata;
+    this.checkpointPreviousVersions = params.checkpointPreviousVersions;
+    this.channels = params.channels;
+    this.deltaChannels = Object.fromEntries(
+      Object.entries(this.channels).filter(([, c]) => isDeltaChannel(c))
+    );
+    this.hasUntrackedChannels = Object.values(this.channels).some(
+      (c) => c.lc_graph_name === "UntrackedValue"
+    );
+    this.checkpointPendingWrites = params.checkpointPendingWrites;
+    // Capture before this run's Command processing adds writes: these are the
+    // delta writes already stored on the loaded checkpoint. RESUME writes are
+    // never delta-channel writes, so the time-travel filter that drops them
+    // below does not affect this set.
+    for (const [tid, ch] of this.checkpointPendingWrites) {
+      if (
+        tid !== NULL_TASK_ID &&
+        isDeltaChannel(this.channels[ch] as BaseChannel)
+      ) {
+        this._storedDeltaWrites.add(`${tid}\u0000${ch}`);
+      }
+    }
+    this.step = params.step;
+    this.stop = params.stop;
+    this.config = params.config;
+    this.checkpointConfig = params.checkpointConfig;
+    this.isNested = params.isNested;
+    this.resumeAtHead = params.resumeAtHead;
+    this.addressedCheckpointSuperseded = params.addressedCheckpointSuperseded;
+    this.manager = params.manager;
+    this.lifecycleEvents = params.hasGraphCallbacks ? [] : undefined;
+    this.outputKeys = params.outputKeys;
+    this.streamKeys = params.streamKeys;
+    this.nodes = params.nodes;
+    this.addressed = params.addressed;
+    this.store = params.store;
+    this.cache = params.cache ? new AsyncBatchedCache(params.cache) : undefined;
+    this.stream = params.stream;
+    this.checkpointNamespace = params.checkpointNamespace;
+    this.prevCheckpointConfig = params.prevCheckpointConfig;
+    this.interruptAfter = params.interruptAfter;
+    this.interruptBefore = params.interruptBefore;
+    this.durability = params.durability;
+    this.debug = params.debug;
+    this.triggerToNodes = params.triggerToNodes;
+    this.control = this.config.control;
+    // Exit-mode delta-channel accumulator: in "exit" durability, per-step
+    // writes are not persisted incrementally, so DeltaChannel writes would be
+    // lost. Accumulate them across the run and persist (anchored to a parent
+    // or stub) at exit. `undefined` outside exit mode disables capture.
+    this._exitDeltaWrites =
+      this.durability === "exit" && this.checkpointer != null ? [] : undefined;
+    this._hasPersistedParent = params.hasPersistedParent ?? false;
+    this._loadedLatest = params.loadedLatest ?? false;
+    this._deltaWritesVersioned = params.deltaWritesVersioned ?? false;
+    this._initialCheckpointConfig = params.checkpointConfig;
+    this.checkpointIdSaved = params.checkpoint.id;
+  }
+
+  static async initialize(params: PregelLoopInitializeParams) {
+    let { config, stream } = params;
+    if (
+      stream !== undefined &&
+      config.configurable?.[CONFIG_KEY_STREAM] !== undefined
+    ) {
+      stream = createDuplexStream(
+        stream,
+        config.configurable[CONFIG_KEY_STREAM]
+      );
+    }
+    const scratchpad = config.configurable?.[CONFIG_KEY_SCRATCHPAD] as
+      | PregelScratchpad
+      | undefined;
+
+    if (config.configurable && scratchpad) {
+      if (scratchpad.subgraphCounter > 0) {
+        config = patchConfigurable(config, {
+          [CONFIG_KEY_CHECKPOINT_NS]: [
+            config.configurable[CONFIG_KEY_CHECKPOINT_NS],
+            scratchpad.subgraphCounter.toString(),
+          ].join(CHECKPOINT_NAMESPACE_SEPARATOR),
+        });
+      }
+
+      scratchpad.subgraphCounter += 1;
+    }
+
+    const isNested = CONFIG_KEY_READ in (config.configurable ?? {});
+    if (
+      !isNested &&
+      config.configurable?.checkpoint_ns !== undefined &&
+      config.configurable?.checkpoint_ns !== ""
+    ) {
+      config = patchConfigurable(config, {
+        checkpoint_ns: "",
+        checkpoint_id: undefined,
+      });
+    }
+    let checkpointConfig = config;
+    if (
+      config.configurable?.checkpoint_id === undefined &&
+      config.configurable?.[CONFIG_KEY_CHECKPOINT_MAP] !== undefined &&
+      config.configurable?.[CONFIG_KEY_CHECKPOINT_MAP]?.[
+        config.configurable?.checkpoint_ns
+      ]
+    ) {
+      checkpointConfig = patchConfigurable(config, {
+        checkpoint_id:
+          config.configurable[CONFIG_KEY_CHECKPOINT_MAP][
+            config.configurable?.checkpoint_ns
+          ],
+      });
+    }
+    // Whether the run points this loop at a checkpoint: a truthy
+    // `checkpoint_id`, this graph's `checkpoint_map` entry, or a replaying
+    // parent. Every task config carries a `checkpoint_id` key, so a key check
+    // would count every subgraph.
+    const addressed = Boolean(
+      checkpointConfig.configurable?.[CONFIG_KEY_CHECKPOINT_ID] ||
+      config.configurable?.[CONFIG_KEY_REPLAY_STATE]
+    );
+    const checkpointNamespace = checkpointNamespaceFromNs(
+      config.configurable?.checkpoint_ns
+    );
+
+    let saved: CheckpointTuple | undefined;
+    let loadedLatest = false;
+    if (!params.checkpointer) {
+      saved = undefined;
+    } else if (checkpointConfig.configurable?.[CONFIG_KEY_CHECKPOINT_ID]) {
+      saved = await params.checkpointer.getTuple(checkpointConfig);
+    } else if (config.configurable?.[CONFIG_KEY_REPLAY_STATE]) {
+      const replayState = config.configurable[
+        CONFIG_KEY_REPLAY_STATE
+      ] as ReplayState;
+      saved = await replayState.getCheckpoint(
+        config.configurable?.[CONFIG_KEY_CHECKPOINT_NS] ?? "",
+        params.checkpointer,
+        checkpointConfig
+      );
+      if (config.configurable) {
+        delete config.configurable[CONFIG_KEY_RESUMING];
+      }
+    } else {
+      saved = await params.checkpointer.getTuple(checkpointConfig);
+      loadedLatest = true;
+    }
+    const hasPersistedParent = saved !== undefined;
+    const addressedConfig = checkpointConfig;
+    if (!saved) {
+      saved = {
+        config,
+        checkpoint: emptyCheckpoint(),
+        metadata: { source: "input", step: -2, parents: {} },
+        pendingWrites: [],
+      };
+    }
+    checkpointConfig = {
+      ...config,
+      ...saved.config,
+      configurable: {
+        checkpoint_ns: "",
+        ...config.configurable,
+        ...saved.config.configurable,
+      },
+    };
+    const prevCheckpointConfig = saved.parentConfig;
+    const checkpoint = copyCheckpoint(saved.checkpoint);
+    const checkpointMetadata = { ...saved.metadata } as CheckpointMetadata;
+    let checkpointPendingWrites = saved.pendingWrites ?? [];
+    const currentCheckpointNamespace = config.configurable?.checkpoint_ns;
+    const checkpointMap = config.configurable?.[CONFIG_KEY_CHECKPOINT_MAP];
+    const isDirectSubgraphTimeTravel =
+      typeof currentCheckpointNamespace === "string" &&
+      currentCheckpointNamespace !== "" &&
+      typeof checkpointMap === "object" &&
+      checkpointMap !== null &&
+      currentCheckpointNamespace in checkpointMap;
+
+    if (isDirectSubgraphTimeTravel && checkpointPendingWrites.length > 0) {
+      // Direct subgraph time-travel should re-fire interrupts instead of
+      // consuming stale resume values that were written during the original run.
+      checkpointPendingWrites = checkpointPendingWrites.filter(
+        ([, channel]) => channel !== RESUME
+      );
+    }
+
+    let resumeAtHead = false;
+    let addressedCheckpointSuperseded = false;
+    // The id the checkpoint was loaded by, which a subgraph replayed through
+    // `checkpoint_map` only gets from the map.
+    if (params.checkpointer && hasPersistedParent) {
+      const superseded = await checkpointSuperseded(
+        params.checkpointer,
+        addressedConfig,
+        saved
+      );
+      const isUpdateOrFork =
+        checkpointMetadata.source === "update" ||
+        checkpointMetadata.source === "fork";
+      resumeAtHead =
+        addressedConfig.configurable?.checkpoint_id !== undefined &&
+        !superseded &&
+        !isUpdateOrFork;
+      addressedCheckpointSuperseded = superseded;
+    }
+
+    const deltaWritesVersioned =
+      Object.values(params.channelSpecs).some(isDeltaChannel) &&
+      (!hasPersistedParent || isDeltaWritesVersioned(saved.metadata));
+    const channels = await channelsFromCheckpoint(
+      params.channelSpecs,
+      checkpoint,
+      {
+        saver: params.checkpointer,
+        config: checkpointConfig,
+        deltaWritesVersioned,
+      }
+    );
+
+    const step = (checkpointMetadata.step ?? 0) + 1;
+    const stop = step + (config.recursionLimit ?? DEFAULT_LOOP_LIMIT) + 1;
+    const checkpointPreviousVersions = { ...checkpoint.channel_versions };
+
+    const store = params.store
+      ? new AsyncBatchedStore(params.store)
+      : undefined;
+
+    if (store) {
+      // Start the store. This is a batch store, so it will run continuously
+      await store.start();
+    }
+    return new PregelLoop({
+      input: params.input,
+      config,
+      checkpointer: params.checkpointer,
+      checkpoint,
+      checkpointMetadata,
+      checkpointConfig,
+      prevCheckpointConfig,
+      checkpointNamespace,
+      channels,
+      isNested,
+      resumeAtHead,
+      addressedCheckpointSuperseded,
+      manager: params.manager,
+      hasGraphCallbacks: params.hasGraphCallbacks,
+      addressed,
+      step,
+      stop,
+      checkpointPreviousVersions,
+      checkpointPendingWrites,
+      outputKeys: params.outputKeys ?? [],
+      streamKeys: params.streamKeys ?? [],
+      nodes: params.nodes,
+      stream,
+      store,
+      cache: params.cache,
+      interruptAfter: params.interruptAfter,
+      interruptBefore: params.interruptBefore,
+      durability: params.durability,
+      debug: params.debug,
+      triggerToNodes: params.triggerToNodes,
+      hasPersistedParent,
+      loadedLatest,
+      deltaWritesVersioned,
+    });
+  }
+
+  protected _checkpointerPutAfterPrevious(input: {
+    config: RunnableConfig;
+    checkpoint: Checkpoint;
+    metadata: CheckpointMetadata;
+    newVersions: Record<string, string | number>;
+  }) {
+    const pendingDeltaWrites = this._pendingDeltaWrites;
+    this._pendingDeltaWrites = [];
+    this._checkpointerChainedPromise = this._checkpointerChainedPromise
+      .then(() => Promise.all(pendingDeltaWrites))
+      .then(() => {
+        return this.checkpointer?.put(
+          input.config,
+          input.checkpoint,
+          input.metadata,
+          input.newVersions
+        );
+      });
+    this._trackCheckpointerPromise(this._checkpointerChainedPromise);
+  }
+
+  /**
+   * Put writes for a task, to be read by the next tick.
+   * @param taskId
+   * @param writes
+   * @param cached The writes were served from the node cache: stream them as
+   * cached and don't write them to the cache again.
+   */
+  putWrites(taskId: string, writes: PendingWrite<string>[], cached = false) {
+    let writesCopy = writes;
+    if (writesCopy.length === 0) return;
+    this._writtenTaskIds.add(taskId);
+    // Before the writes are saved, kept in `checkpointPendingWrites` or
+    // applied, so all of them hold the same message ids.
+    const deltaWrites = ensureDeltaMessageIds(this.channels, writes);
+
+    // deduplicate writes to special channels, last write wins
+    if (writesCopy.every(([key]) => key in WRITES_IDX_MAP)) {
+      writesCopy = Array.from(
+        new Map(writesCopy.map((w) => [w[0], w])).values()
+      );
+    }
+
+    // Sanitize writes for checkpointing: remove UntrackedValue writes and sanitize Send packets
+    let writesToSave = writesCopy;
+    if (this.hasUntrackedChannels) {
+      writesToSave = writesCopy
+        .filter(([c]) => {
+          // Don't persist UntrackedValue channel writes
+          const channel = this.channels[c];
+          return !channel || channel.lc_graph_name !== "UntrackedValue";
+        })
+        .map(([c, v]) => {
+          // Sanitize UntrackedValues nested within Send packets
+          if (c === TASKS && _isSend(v)) {
+            return [c, sanitizeUntrackedValuesInSend(v, this.channels)] as [
+              string,
+              unknown,
+            ];
+          }
+          return [c, v] as [string, unknown];
+        });
+    }
+
+    // remove existing writes for this task
+    this.checkpointPendingWrites = this.checkpointPendingWrites.filter(
+      (w) => w[0] !== taskId
+    );
+
+    // save writes
+    for (const [c, v] of writesToSave) {
+      this.checkpointPendingWrites.push([taskId, c, v]);
+    }
+
+    const config = patchConfigurable(this.checkpointConfig, {
+      [CONFIG_KEY_CHECKPOINT_NS]: this.config.configurable?.checkpoint_ns ?? "",
+      [CONFIG_KEY_CHECKPOINT_ID]: this.checkpoint.id,
+    });
+
+    if (this.durability !== "exit" && this.checkpointer != null) {
+      const task = this.tasks[taskId];
+      // Use sanitized writes for checkpointer; the task's serialized path
+      // orders its writes on replay (`writesSortKey`), `""` when the task
+      // is unknown (e.g. `NULL_TASK_ID`), matching Python's
+      // `task_path_str(task.path) if task else ""`.
+      const saved = this.checkpointer.putWrites(
+        config,
+        writesToSave,
+        taskId,
+        task != null ? taskPathStr(task.path) : ""
+      );
+      this._trackCheckpointerPromise(saved);
+      if (deltaWrites.length > 0) this._pendingDeltaWrites.push(saved);
+    }
+
+    if (this.tasks) {
+      this._outputWrites(taskId, writesCopy, cached);
+    }
+
+    if (cached || !writes.length || !this.cache || !this.tasks) {
+      return;
+    }
+
+    // only cache tasks with a cache key
+    const task = this.tasks[taskId];
+    if (task == null || task.cache_key == null) {
+      return;
+    }
+
+    // only cache successful tasks
+    if (writes[0][0] === ERROR || writes[0][0] === INTERRUPT) {
+      return;
+    }
+
+    void this.cache.set([
+      {
+        key: [task.cache_key.ns, task.cache_key.key],
+        value: task.writes,
+        ttl: task.cache_key.ttl,
+      },
+    ]);
+  }
+
+  /** Streams the writes reapplied to tasks that finished in a previous run. */
+  protected _outputCachedWrites(tasks: PregelExecutableTask<any, any>[]) {
+    for (const task of tasks) {
+      if (task.writes.length > 0) {
+        this._outputWrites(task.id, task.writes, true);
+      }
+    }
+  }
+
+  _outputWrites(taskId: string, writes: [string, unknown][], cached = false) {
+    const task = this.tasks[taskId];
+    if (task !== undefined) {
+      if (
+        task.config !== undefined &&
+        (task.config.tags ?? []).includes(TAG_HIDDEN)
+      ) {
+        return;
+      }
+
+      if (writes.length > 0) {
+        if (writes[0][0] === INTERRUPT) {
+          // in `algo.ts` we append a bool to the task path to indicate
+          // whether or not a call was present. If so, we don't emit the
+          // the interrupt as it'll be emitted by the parent.
+          if (
+            task.path?.[0] === PUSH &&
+            task.path?.[task.path.length - 1] === true
+          )
+            return;
+
+          const interruptWrites = writes
+            .filter((w) => w[0] === INTERRUPT)
+            .flatMap((w) => w[1] as string[]);
+
+          this._emit([
+            ["updates", { [INTERRUPT]: interruptWrites }],
+            ["values", { [INTERRUPT]: interruptWrites }],
+          ]);
+        } else if (writes[0][0] !== ERROR) {
+          this._emit(
+            gatherIteratorSync(
+              prefixGenerator(
+                mapOutputUpdates(this.outputKeys, [[task, writes]], cached),
+                "updates"
+              )
+            )
+          );
+        }
+      }
+      if (!cached) {
+        this._emit(
+          gatherIteratorSync(
+            prefixGenerator(
+              mapDebugTaskResults([[task, writes]], this.streamKeys),
+              "tasks"
+            )
+          )
+        );
+      }
+    }
+  }
+
+  async _matchCachedWrites() {
+    if (!this.cache) return [];
+
+    const matched: {
+      task: PregelExecutableTask<string, string>;
+      result: unknown;
+    }[] = [];
+
+    const serializeKey = ([ns, key]: CacheFullKey) => {
+      return `ns:${ns.join(",")}|key:${key}`;
+    };
+
+    const keys: CacheFullKey[] = [];
+    const keyMap: Record<string, PregelExecutableTask<string, string>> = {};
+
+    for (const task of Object.values(this.tasks)) {
+      if (task.cache_key != null && !task.writes.length) {
+        keys.push([task.cache_key.ns, task.cache_key.key]);
+        keyMap[serializeKey([task.cache_key.ns, task.cache_key.key])] = task;
+      }
+    }
+
+    if (keys.length === 0) return [];
+    const cache = await this.cache.get(keys);
+
+    for (const { key, value } of cache) {
+      const task = keyMap[serializeKey(key)];
+      if (task != null) {
+        // update the task with the cached writes
+        task.writes.push(...value);
+        matched.push({ task, result: value });
+      }
+    }
+
+    return matched;
+  }
+
+  /**
+   * Execute a single iteration of the Pregel loop.
+   * Returns true if more iterations are needed.
+   * @param params - The input keys to use for the tick.
+   * @returns True if more iterations are needed, false otherwise.
+   */
+  async tick(params: { inputKeys?: string | string[] }): Promise<boolean> {
+    if (this.store && !this.store.isRunning) {
+      await this.store?.start();
+    }
+    const { inputKeys = [] } = params;
+    if (this.status !== "pending") {
+      throw new Error(
+        `Cannot tick when status is no longer "pending". Current status: "${this.status}"`
+      );
+    }
+    if (![INPUT_DONE, INPUT_RESUMING].includes(this.input)) {
+      await this._first(inputKeys);
+    } else if (this.toInterrupt.length > 0) {
+      this.status = "interrupt_before";
+      throw new GraphInterrupt();
+    } else if (
+      Object.values(this.tasks).every((task) => task.writes.length > 0)
+    ) {
+      const finishTaskList = Object.values(this.tasks);
+      // finish superstep
+      const writes = finishTaskList.flatMap((t) => t.writes);
+      // All tasks have finished
+      this.updatedChannels = _applyWrites(
+        this.checkpoint,
+        this.channels,
+        finishTaskList,
+        this.checkpointerGetNextVersion,
+        this.triggerToNodes
+      );
+      // Track DeltaChannels that saw an Overwrite this super-step. They must
+      // snapshot at the next checkpoint so sparse replay starts from the
+      // post-overwrite value (live `update` already discarded the siblings).
+      for (const [ch, v] of deltaChannelWrites(this.channels, writes)) {
+        if (_isOverwriteValue(v)) this._deltaChannelsForcedSnapshot.add(ch);
+      }
+      if (this._resumeLoadedWrites.length > 0) {
+        // A loaded write the resume didn't hand back belongs to a task this
+        // run drops or reruns: a `Send` that `Command({ goto })` replaced, or
+        // an error handler that runs again.
+        for (const ch of deltaChannelsWithPendingWrites(
+          this.channels,
+          this._resumeLoadedWrites.filter(
+            ([tid]) => !this._reappliedTaskIds.has(tid)
+          )
+        )) {
+          this._deltaChannelsForcedSnapshot.add(ch);
+        }
+        this._resumeLoadedWrites = [];
+      }
+      // produce values output
+      const valuesOutput = await gatherIterator(
+        prefixGenerator(
+          mapOutputValues(this.outputKeys, writes, this.channels),
+          "values"
+        )
+      );
+      // capture delta-channel writes for the exit-mode accumulator before
+      // clearing (in "exit" durability they are not persisted incrementally)
+      if (this._exitDeltaWrites !== undefined) {
+        // On the first superstep the pending writes still hold the ones
+        // loaded with the checkpoint, which are already stored on it.
+        const first = this._exitFirstStep === null;
+        if (first) {
+          this._exitFirstStep = this.step;
+          for (const [ch, v] of this._exitCommandWrites) {
+            this._exitDeltaWrites.push([this.step, NULL_TASK_ID, "", ch, v]);
+          }
+        }
+        for (const [tid, ch, v] of this.checkpointPendingWrites) {
+          const channel = this.channels[ch];
+          if (channel == null || !isDeltaChannel(channel)) continue;
+          if (
+            first &&
+            (tid === NULL_TASK_ID ||
+              this._storedDeltaWrites.has(`${tid}\u0000${ch}`))
+          ) {
+            continue;
+          }
+          const task = this.tasks[tid];
+          this._exitDeltaWrites.push([
+            this.step,
+            tid,
+            task != null ? taskPathStr(task.path) : "",
+            ch,
+            v,
+          ]);
+        }
+      }
+      // clear pending writes
+      this.checkpointPendingWrites = [];
+      // persist the new checkpoint BEFORE emitting values, so the
+      // attached `checkpoint` envelope on the values event points at
+      // the fork target that captures this superstep's final state.
+      await this._putCheckpoint({ source: "loop" });
+      if (this.durability === "sync") {
+        // Task writes are persisted as tasks finish, while the checkpoint is
+        // scheduled above. Do not prepare the next superstep until all
+        // persistence caused by this completed superstep has settled.
+        await this._awaitCheckpointerPromises();
+      }
+      this._emitValuesWithCheckpointMeta(valuesOutput);
+      // after execution, check if we should interrupt
+      if (
+        shouldInterrupt(this.checkpoint, this.interruptAfter, finishTaskList)
+      ) {
+        this.status = "interrupt_after";
+        throw new GraphInterrupt();
+      }
+
+      // unset resuming flag
+      if (this.config.configurable?.[CONFIG_KEY_RESUMING] !== undefined) {
+        delete this.config.configurable?.[CONFIG_KEY_RESUMING];
+      }
+    } else {
+      return false;
+    }
+    if (this.step > this.stop) {
+      this.status = "out_of_steps";
+      return false;
+    }
+
+    const nextTasks = _prepareNextTasks(
+      this.checkpoint,
+      this.checkpointPendingWrites,
+      this.nodes,
+      this.channels,
+      this.config,
+      true,
+      {
+        step: this.step,
+        checkpointer: this.checkpointer,
+        isResuming: this.isResuming,
+        manager: this.manager,
+        store: this.store,
+        stream: this.stream,
+        triggerToNodes: this.triggerToNodes,
+        updatedChannels: this.updatedChannels,
+      }
+    );
+    this.tasks = nextTasks;
+    let taskList = Object.values(this.tasks);
+
+    // Full-state checkpoint snapshots are expensive; skip unless a consumer
+    // subscribed to "checkpoints" or the legacy "debug" wrapper mode.
+    if (
+      this.checkpointer &&
+      (this.stream.modes.has("checkpoints") || this.stream.modes.has("debug"))
+    ) {
+      this._emit(
+        await gatherIterator(
+          prefixGenerator(
+            mapDebugCheckpoint(
+              this.checkpointConfig,
+              this.channels,
+              this.streamKeys,
+              this.checkpointMetadata,
+              taskList,
+              this.checkpointPendingWrites,
+              this.prevCheckpointConfig,
+              this.outputKeys
+            ),
+            "checkpoints"
+          )
+        )
+      );
+    }
+
+    if (taskList.length === 0) {
+      this.status = "done";
+      return false;
+    }
+    // if there are pending writes from a previous loop, apply them
+    if (this.skipDoneTasks && this.checkpointPendingWrites.length > 0) {
+      this._reapplyWritesToSucceededNodes(this.tasks);
+      // On resume, re-schedule error handlers for nodes that failed in a prior
+      // run (recorded via ERROR_SOURCE_NODE) before they completed handling.
+      this._resumeErrorHandlersIfApplicable();
+      // Re-scheduling can add handler tasks to `this.tasks`, so refresh the
+      // cached task list before emitting writes and the downstream re-tick /
+      // interrupt / debug checks see the newly scheduled handlers.
+      taskList = Object.values(this.tasks);
+    }
+    // if all tasks have finished, re-tick
+    if (taskList.every((task) => task.writes.length > 0)) {
+      this._outputCachedWrites(taskList);
+      return this.tick({ inputKeys });
+    }
+
+    // Before execution, check if we should interrupt
+    if (shouldInterrupt(this.checkpoint, this.interruptBefore, taskList)) {
+      this.status = "interrupt_before";
+      throw new GraphInterrupt();
+    }
+
+    // Cooperative drain: the previous superstep's writes have been applied
+    // and checkpointed above, and the next tasks have been prepared. If a
+    // drain was requested and tasks remain, stop here (without dispatching
+    // them) so the run can be resumed later from the saved checkpoint. This
+    // comes after the breakpoint check: a resume passes the next step's
+    // breakpoints, so draining in front of one would skip it.
+    if (this.control != null && this.control.drainRequested) {
+      this.status = "draining";
+      return false;
+    }
+
+    // Stream the reapplied writes only after the breakpoint and drain checks:
+    // a run that stops at either would stream them again when it resumes.
+    this._outputCachedWrites(taskList);
+
+    if (this.stream.modes.has("tasks") || this.stream.modes.has("debug")) {
+      const debugOutput = await gatherIterator(
+        prefixGenerator(mapDebugTasks(taskList), "tasks")
+      );
+      this._emit(debugOutput);
+    }
+
+    return true;
+  }
+
+  async finishAndHandleError(error?: Error) {
+    // persist current checkpoint and writes
+    if (
+      this.durability === "exit" &&
+      // if it's a top graph
+      (!this.isNested ||
+        // or a nested graph with error or interrupt
+        typeof error !== "undefined" ||
+        // or a nested graph with checkpointer: true
+        this.checkpointNamespace.every(
+          (part) => !part.includes(CHECKPOINT_NAMESPACE_END)
+        ))
+    ) {
+      await this._putExitDeltaWrites();
+      this._putCheckpoint(this.checkpointMetadata);
+      this._flushPendingWrites();
+    }
+
+    const suppress = this._suppressInterrupt(error);
+    if (suppress || error === undefined) {
+      this.output = readChannels(this.channels, this.outputKeys);
+    }
+    if (suppress) {
+      // emit one last "values" event, with pending writes applied
+      if (
+        this.tasks !== undefined &&
+        this.checkpointPendingWrites.length > 0 &&
+        Object.values(this.tasks).some((task) => task.writes.length > 0)
+      ) {
+        this.updatedChannels = _applyWrites(
+          this.checkpoint,
+          this.channels,
+          Object.values(this.tasks),
+          this.checkpointerGetNextVersion,
+          this.triggerToNodes
+        );
+
+        this._emitValuesWithCheckpointMeta(
+          gatherIteratorSync(
+            prefixGenerator(
+              mapOutputValues(
+                this.outputKeys,
+                Object.values(this.tasks).flatMap((t) => t.writes),
+                this.channels
+              ),
+              "values"
+            )
+          )
+        );
+      }
+
+      // Emit INTERRUPT event (not a state snapshot — no checkpoint envelope)
+      if (isGraphInterrupt(error) && !error.interrupts.length) {
+        this._emit(
+          [
+            ["updates", { [INTERRUPT]: [] }],
+            ["values", { [INTERRUPT]: [] }],
+          ],
+          this.#interruptStreamNamespace()
+        );
+      }
+    }
+    return suppress;
+  }
+
+  async acceptPush(
+    task: PregelExecutableTask<string, string>,
+    writeIdx: number,
+    call?: Call
+  ): Promise<PregelExecutableTask<string, string> | void> {
+    if (
+      this.interruptAfter?.length > 0 &&
+      shouldInterrupt(this.checkpoint, this.interruptAfter, [task])
+    ) {
+      this.toInterrupt.push(task);
+      return;
+    }
+
+    const pushed = _prepareSingleTask(
+      [PUSH, task.path ?? [], writeIdx, task.id, call] as CallTaskPath,
+      this.checkpoint,
+      this.checkpointPendingWrites,
+      this.nodes,
+      this.channels,
+      task.config ?? {},
+      true,
+      {
+        step: this.step,
+        checkpointer: this.checkpointer,
+        manager: this.manager,
+        store: this.store,
+        stream: this.stream,
+      }
+    );
+
+    if (!pushed) return;
+    if (
+      this.interruptBefore?.length > 0 &&
+      shouldInterrupt(this.checkpoint, this.interruptBefore, [pushed])
+    ) {
+      this.toInterrupt.push(pushed);
+      return;
+    }
+
+    if (this.stream.modes.has("tasks") || this.stream.modes.has("debug")) {
+      this._emit(
+        gatherIteratorSync(prefixGenerator(mapDebugTasks([pushed]), "tasks"))
+      );
+    }
+
+    if (this.debug) printStepTasks(this.step, [pushed]);
+    this.tasks[pushed.id] = pushed;
+    if (this.skipDoneTasks) this._matchWrites({ [pushed.id]: pushed });
+
+    const tasks = await this._matchCachedWrites();
+    for (const { task } of tasks) {
+      this.putWrites(task.id, task.writes, true);
+    }
+
+    return pushed;
+  }
+
+  /**
+   * Returns the name of the error handler node registered for `nodeName`, or
+   * `undefined` if none is configured.
+   */
+  getErrorHandlerNode(nodeName: string): string | undefined {
+    return this.nodes[nodeName]?.errorHandlerNode;
+  }
+
+  /**
+   * Whether `nodeName` is itself an auto-generated error handler node.
+   */
+  isErrorHandlerNode(nodeName: string): boolean {
+    return this.nodes[nodeName]?.isErrorHandler === true;
+  }
+
+  /**
+   * Schedule a node-level error handler task for a task that failed after its
+   * retry policy was exhausted. Prepares the handler task (injecting a
+   * {@link NodeError}), registers it so the runner executes it within the
+   * current step, and returns it (or `undefined` if no handler applies).
+   *
+   * The failure provenance (`ERROR` + `ERROR_SOURCE_NODE`) is checkpointed by
+   * the runner via {@link PregelLoop#putWrites} so handlers observe the same
+   * context after a resume.
+   */
+  scheduleErrorHandler(
+    failedTask: PregelExecutableTask<string, string>,
+    error: Error
+  ): PregelExecutableTask<string, string> | undefined {
+    const handlerNode = this.getErrorHandlerNode(String(failedTask.name));
+    if (!handlerNode) return undefined;
+
+    const handlerTask = _prepareNodeErrorHandlerTask(
+      failedTask,
+      handlerNode,
+      error,
+      this.checkpoint,
+      this.checkpointPendingWrites,
+      this.nodes,
+      this.channels,
+      failedTask.config ?? this.config,
+      {
+        step: this.step,
+        checkpointer: this.checkpointer,
+        manager: this.manager,
+        store: this.store,
+        stream: this.stream,
+      }
+    ) as PregelExecutableTask<string, string> | undefined;
+
+    if (handlerTask === undefined) return undefined;
+
+    this.tasks[handlerTask.id] = handlerTask;
+
+    this._emit(
+      gatherIteratorSync(prefixGenerator(mapDebugTasks([handlerTask]), "tasks"))
+    );
+    if (this.debug) printStepTasks(this.step, [handlerTask]);
+
+    return handlerTask;
+  }
+
+  /**
+   * On resume, re-schedule error handlers for tasks that failed in a prior run
+   * but had not finished being handled. Scans pending writes for
+   * `ERROR_SOURCE_NODE` markers (paired with `ERROR`), marks the originating
+   * task as done (so the runner won't re-run it), and prepares a fresh handler
+   * task so the runner picks it up.
+   */
+  protected _resumeErrorHandlersIfApplicable() {
+    // Collect failed task ids with both ERROR_SOURCE_NODE and ERROR writes.
+    const failed = new Map<string, Error>();
+    for (const [tid, chan] of this.checkpointPendingWrites) {
+      if (chan !== ERROR_SOURCE_NODE) continue;
+      const errorWrite = this.checkpointPendingWrites.find(
+        ([t, c]) => t === tid && c === ERROR
+      );
+      if (errorWrite === undefined) continue;
+      const value = errorWrite[2] as { message?: string; name?: string };
+      const error = new Error(value?.message ?? String(value));
+      if (value?.name) error.name = value.name;
+      failed.set(tid, error);
+    }
+
+    for (const [tid, error] of failed) {
+      const task = this.tasks[tid];
+      if (task === undefined) continue;
+      const handlerNode = this.getErrorHandlerNode(String(task.name));
+      if (!handlerNode) continue;
+      // Non-empty writes => runner's `writes.length === 0` filter skips it.
+      if (task.writes.length === 0) {
+        task.writes.push([ERROR, { message: error.message, name: error.name }]);
+      }
+      this.scheduleErrorHandler(task, error);
+    }
+  }
+
+  protected _suppressInterrupt(e?: Error): boolean {
+    if (!isGraphInterrupt(e) || this.isNested) return false;
+    this.lifecycleEvents?.push({
+      runId: this.manager?.runId,
+      status: this.status,
+      checkpointId: this.checkpoint.id,
+      checkpointNs: [...this.checkpointNamespace],
+      interrupts: [...e.interrupts],
+    });
+    return true;
+  }
+
+  protected async _first(inputKeys: string | string[]) {
+    /*
+     * Resuming from previous checkpoint requires
+     * - finding a previous checkpoint
+     * - receiving null input (outer graph) or RESUMING flag (subgraph)
+     */
+
+    const { configurable } = this.config;
+    const inputIsCommand = isCommand(this.input);
+
+    const isTimeTraveling =
+      this.addressed &&
+      // Time-travel to a subgraph checkpoint: the parent sets RESUMING=True
+      // (it can't distinguish time-travel from resume), so we check if this
+      // subgraph's own ns is in checkpoint_map.
+      ((this.isNested &&
+        configurable?.[CONFIG_KEY_CHECKPOINT_NS] !== undefined &&
+        configurable?.[CONFIG_KEY_CHECKPOINT_NS] !== "" &&
+        configurable?.[CONFIG_KEY_CHECKPOINT_MAP] !== undefined &&
+        configurable[CONFIG_KEY_CHECKPOINT_NS] in
+          configurable[CONFIG_KEY_CHECKPOINT_MAP]) ||
+        !(
+          (inputIsCommand && (this.input as Command).resume != null) ||
+          configurable?.[CONFIG_KEY_RESUMING] === true ||
+          this.resumeAtHead
+        ));
+    // Finished tasks rerun only on time travel, or on a resume at a checkpoint
+    // the thread has moved past. A resume addressed at the thread's latest
+    // checkpoint hands their writes back, as without an id.
+    this.skipDoneTasks = !(
+      isTimeTraveling || this.addressedCheckpointSuperseded
+    );
+    const isUpdateOrFork =
+      this.checkpointMetadata.source === "update" ||
+      this.checkpointMetadata.source === "fork";
+    // Whether this run saves a fork checkpoint (below) to start its branch.
+    // The fork carries a `Command`'s writes itself, so nothing this run writes
+    // is stored on the checkpoint it addressed, which may have children that
+    // replay it.
+    const forks =
+      isTimeTraveling &&
+      (inputIsCommand || this.isResuming) &&
+      (!isUpdateOrFork || this.addressedCheckpointSuperseded);
+    const carried: CheckpointPendingWrite[] = [];
+    // A resume that hands the head's pending writes back to their tasks only
+    // learns which of them go back once those are scheduled, so the end of
+    // the superstep seals the rest. Kept apart from the writes this run adds.
+    const reapplies = this.isResuming && this.skipDoneTasks;
+    this._resumeLoadedWrites = reapplies
+      ? this.checkpointPendingWrites.filter(([tid]) => tid !== NULL_TASK_ID)
+      : [];
+    this._reappliedTaskIds = new Set();
+    this._deltaChannelsForcedSnapshot = reapplies
+      ? new Set()
+      : deltaChannelsWithPendingWrites(
+          this.channels,
+          this.checkpointPendingWrites
+        );
+
+    // map command to writes
+    if (inputIsCommand) {
+      const command = this.input as Command;
+      const hasResume = command.resume != null;
+
+      if (
+        command.resume != null &&
+        typeof command.resume === "object" &&
+        Object.keys(command.resume).every(isXXH3)
+      ) {
+        this.config.configurable ??= {};
+        this.config.configurable[CONFIG_KEY_RESUME_MAP] = command.resume;
+      }
+
+      if (hasResume && this.checkpointer == null) {
+        throw new Error("Cannot use Command(resume=...) without checkpointer");
+      }
+
+      if (
+        hasResume &&
+        this.config.configurable?.[CONFIG_KEY_STRICT_RESUME] === true &&
+        // Nested calls inherit the parent's configurable.
+        !this.isNested &&
+        // A finished task can rerun and interrupt again on replay, while its
+        // earlier output still makes its interrupt look answered.
+        !this.addressedCheckpointSuperseded
+      ) {
+        this._refuseUnmatchedResume(command.resume);
+      }
+
+      const writes: { [key: string]: PendingWrite[] } = {};
+
+      // group writes by task id
+      for (const [tid, key, value] of mapCommand(
+        command,
+        this.checkpointPendingWrites
+      )) {
+        writes[tid] ??= [];
+        writes[tid].push([key, value]);
+      }
+      if (Object.keys(writes).length === 0) {
+        throw new EmptyInputError("Received empty Command input");
+      }
+
+      // save writes
+      for (const [tid, ws] of Object.entries(writes)) {
+        if (forks) {
+          // These skip `putWrites`, which gives messages their ids.
+          ensureDeltaMessageIds(this.channels, ws);
+          for (const [c, v] of ws) carried.push([tid, c, v]);
+        } else {
+          this.putWrites(tid, ws);
+          if (this._exitDeltaWrites !== undefined && tid === NULL_TASK_ID) {
+            this._exitCommandWrites.push(
+              ...deltaChannelWrites(this.channels, ws)
+            );
+          }
+        }
+      }
+      for (const ch of deltaChannelsWithPendingWrites(this.channels, carried)) {
+        this._deltaChannelsForcedSnapshot.add(ch);
+      }
+    }
+
+    // apply null writes
+    const nullWrites = [...(this.checkpointPendingWrites ?? []), ...carried]
+      .filter((w) => w[0] === NULL_TASK_ID)
+      .map((w) => w.slice(1)) as PendingWrite<string>[];
+    if (nullWrites.length > 0) {
+      _applyWrites(
+        this.checkpoint,
+        this.channels,
+        [
+          {
+            name: INPUT,
+            writes: nullWrites,
+            triggers: [],
+          },
+        ],
+        this.checkpointerGetNextVersion,
+        this.triggerToNodes
+      );
+    }
+    const isCommandUpdateOrGoto = inputIsCommand && nullWrites.length > 0;
+
+    if (isTimeTraveling) {
+      this.checkpointPendingWrites = this.checkpointPendingWrites.filter(
+        (w) => w[1] !== RESUME
+      );
+    }
+
+    // Take the resume value from the parent only after the time-travel filter
+    // above, which drops this checkpoint's stale RESUME writes, not this one.
+    // A run that forks stores it on the fork, below.
+    const nullResume = (
+      configurable?.[CONFIG_KEY_SCRATCHPAD] as PregelScratchpad | undefined
+    )?.nullResume;
+    if (nullResume !== undefined && !forks) {
+      this.putWrites(NULL_TASK_ID, [[RESUME, nullResume]]);
+    }
+
+    // The parent checkpoint subgraphs replay from, when the fork below would
+    // otherwise move it
+    let replayBound: RunnableConfig | undefined;
+    const cachedIsResuming = this.isResuming;
+    if (cachedIsResuming || isCommandUpdateOrGoto) {
+      // One spread (O(N)) instead of O(N²) per-channel spreads. Must be a
+      // new object — copyCheckpoint shallow-copies versions_seen.
+      const interruptSeen: Record<string, string | number> = {
+        ...this.checkpoint.versions_seen[INTERRUPT],
+      };
+      for (const channelName in this.channels) {
+        if (!Object.prototype.hasOwnProperty.call(this.channels, channelName))
+          continue;
+        if (this.checkpoint.channel_versions[channelName] !== undefined) {
+          interruptSeen[channelName] =
+            this.checkpoint.channel_versions[channelName];
+        }
+      }
+      this.checkpoint.versions_seen[INTERRUPT] = interruptSeen;
+
+      // An update or fork checkpoint is a branch of its own, unless the thread
+      // moved past it: its other children would replay whatever this run
+      // stores on it.
+      if (forks) {
+        if (isUpdateOrFork && this.prevCheckpointConfig) {
+          replayBound = this.prevCheckpointConfig;
+        }
+        this.checkpointPendingWrites = this.checkpointPendingWrites.filter(
+          (w) => w[1] !== INTERRUPT
+        );
+        await this._putCheckpoint({ source: "fork" });
+        if (nullResume !== undefined) {
+          this.putWrites(NULL_TASK_ID, [[RESUME, nullResume]]);
+        }
+      }
+
+      // produce values output
+      const valuesOutput = await gatherIterator(
+        prefixGenerator(
+          mapOutputValues(this.outputKeys, true, this.channels),
+          "values"
+        )
+      );
+      // Preserve the original `isResuming`-first priority: when both
+      // `isResuming` and `isCommandUpdateOrGoto` are true (resuming from
+      // an interrupt with a Command update/goto), the resume path wins
+      // and no new input checkpoint is created here.
+      if (cachedIsResuming) {
+        this.input = INPUT_RESUMING;
+      } else if (isCommandUpdateOrGoto) {
+        // Persist the input checkpoint BEFORE emitting values so the
+        // attached `checkpoint` envelope points at the just-created
+        // fork target. We need a new checkpoint for Command(update=...)
+        // or Command(goto=...) in case the result of Command(goto=...)
+        // is an interrupt. If not done, the checkpoint containing the
+        // interrupt will be lost.
+        await this._putCheckpoint({ source: "input" });
+        this.input = INPUT_DONE;
+      }
+      // Emit after any checkpoint persistence so the `checkpoint` envelope
+      // on the values event points at the fork target for the emitted state.
+      this._emitValuesWithCheckpointMeta(valuesOutput);
+    } else {
+      // map inputs to channel updates
+      const inputWrites = await gatherIterator(mapInput(inputKeys, this.input));
+      if (inputWrites.length > 0) {
+        // Before the input is applied, so this run reads the message ids that
+        // are saved with it.
+        const deltaInput = ensureDeltaMessageIds(
+          this.channels,
+          inputWrites as PendingWrite[]
+        );
+        const discardTasks = _prepareNextTasks(
+          this.checkpoint,
+          this.checkpointPendingWrites,
+          this.nodes,
+          this.channels,
+          this.config,
+          true,
+          { step: this.step }
+        );
+        this.updatedChannels = _applyWrites(
+          this.checkpoint,
+          this.channels,
+          (Object.values(discardTasks) as WritesProtocol[]).concat([
+            {
+              name: INPUT,
+              writes: inputWrites as PendingWrite[],
+              triggers: [],
+            },
+          ]),
+          this.checkpointerGetNextVersion,
+          this.triggerToNodes
+        );
+        // An Overwrite supplied as input must also force a snapshot.
+        for (const [c, v] of deltaInput) {
+          if (_isOverwriteValue(v)) this._deltaChannelsForcedSnapshot.add(c);
+        }
+        if (deltaInput.length > 0) {
+          if (this._exitDeltaWrites !== undefined) {
+            // Exit mode: input writes never enter `checkpointPendingWrites`,
+            // so the after-tick capture misses them; capture them here.
+            for (const [c, v] of deltaInput) {
+              this._exitDeltaWrites.push([this.step, NULL_TASK_ID, "", c, v]);
+            }
+          } else if (this.checkpointer != null) {
+            // A DeltaChannel reads its input from the writes stored on the
+            // checkpoint this run starts from, under a task id of their own:
+            // readers apply a checkpoint's NULL_TASK_ID writes as its own
+            // state. A new thread has no checkpoint to store them on, and one
+            // a `checkpoint_id` addressed may have children that would read
+            // them, so then the input checkpoint snapshots the channel instead.
+            if (this._hasPersistedParent && this._loadedLatest) {
+              this.putWrites(uuid5(INPUT, this.checkpoint.id), deltaInput);
+            } else {
+              for (const [c] of deltaInput) {
+                this._deltaChannelsForcedSnapshot.add(c);
+              }
+            }
+          }
+        }
+        // save input checkpoint
+        await this._putCheckpoint({ source: "input" });
+
+        this.input = INPUT_DONE;
+      } else if (!(CONFIG_KEY_RESUMING in (this.config.configurable ?? {}))) {
+        throw new EmptyInputError(
+          `Received no input writes for ${JSON.stringify(inputKeys, null, 2)}`
+        );
+      } else {
+        // done with input
+        this.input = INPUT_DONE;
+      }
+    }
+    if (!this.isNested) {
+      let replayState: ReplayState | undefined;
+      // Only pass ReplayState during time-travel, not when resuming from the
+      // current head with an explicit checkpoint_id (see Python _loop._first).
+      if (isTimeTraveling) {
+        let replayCheckpointId = this.checkpoint.id;
+        if (replayBound !== undefined) {
+          replayCheckpointId =
+            replayBound.configurable?.[CONFIG_KEY_CHECKPOINT_ID] ??
+            replayCheckpointId;
+        } else if (
+          (this.checkpointMetadata.source === "update" ||
+            this.checkpointMetadata.source === "fork") &&
+          this.prevCheckpointConfig
+        ) {
+          replayCheckpointId =
+            this.prevCheckpointConfig.configurable?.[
+              CONFIG_KEY_CHECKPOINT_ID
+            ] ?? replayCheckpointId;
+        }
+        replayState = new ReplayState(replayCheckpointId);
+      }
+      this.config = patchConfigurable(this.config, {
+        [CONFIG_KEY_RESUMING]: this.isResuming,
+        [CONFIG_KEY_REPLAY_STATE]: replayState,
+      });
+    }
+    if (cachedIsResuming) {
+      this.lifecycleEvents?.push({
+        runId: this.manager?.runId,
+        status: this.status,
+        checkpointId: this.checkpoint.id,
+        checkpointNs: [...this.checkpointNamespace],
+      });
+    }
+  }
+
+  #interruptStreamNamespace(): string[] {
+    const ns = this.checkpointNamespace;
+    const isRootNamespace =
+      ns.length === 0 || (ns.length === 1 && ns[0] === "");
+    if (
+      !isRootNamespace ||
+      this.config.configurable?.[CONFIG_KEY_STREAM] === undefined
+    ) {
+      return ns;
+    }
+    const deepest = deepestCheckpointMapNamespace(
+      this.config.configurable?.[CONFIG_KEY_CHECKPOINT_MAP] as
+        | Record<string, string>
+        | undefined
+    );
+    return deepest.length > 0 ? deepest : ns;
+  }
+
+  protected _emit(
+    values: Array<[StreamMode, unknown]>,
+    namespace: string[] = this.checkpointNamespace
+  ) {
+    for (const [mode, payload] of values) {
+      if (this.stream.modes.has(mode)) {
+        this.stream.push([namespace, mode, payload]);
+      }
+
+      // debug mode is a "checkpoints" or "tasks" wrapped in an object
+      // TODO: consider deprecating this in 1.x
+      if (
+        (mode === "checkpoints" || mode === "tasks") &&
+        this.stream.modes.has("debug")
+      ) {
+        const step = mode === "checkpoints" ? this.step - 1 : this.step;
+        const timestamp = new Date().toISOString();
+        const type = (() => {
+          if (mode === "checkpoints") {
+            return "checkpoint";
+          } else if (
+            typeof payload === "object" &&
+            payload != null &&
+            "result" in payload
+          ) {
+            return "task_result";
+          } else {
+            return "task";
+          }
+        })();
+
+        this.stream.push([
+          namespace,
+          "debug",
+          { step, type, timestamp, payload },
+        ]);
+      }
+    }
+  }
+
+  /**
+   * Build a {@link StreamChunkMeta} describing the currently active checkpoint.
+   * Emitted as a separate ``[namespace, "checkpoints", envelope]`` chunk before
+   * the paired ``values`` chunk. Returns `undefined` if no checkpoint metadata
+   * is available yet.
+   */
+  protected _currentCheckpointMeta(): StreamChunkMeta | undefined {
+    if (!this.checkpointMetadata || !this.checkpoint?.id) return undefined;
+    const parent_id = this.prevCheckpointConfig?.configurable?.checkpoint_id as
+      | string
+      | undefined;
+    return {
+      checkpoint: {
+        id: this.checkpoint.id,
+        ...(parent_id ? { parent_id } : {}),
+        step: this.checkpointMetadata.step,
+        source: this.checkpointMetadata.source,
+      },
+    };
+  }
+
+  /**
+   * Emit stream entries. When checkpoint meta is available, push a lightweight
+   * ``[namespace, "checkpoints", envelope]`` chunk before each ``values`` chunk.
+   */
+  protected _emitValuesWithCheckpointMeta(
+    entries: [StreamMode, unknown][]
+  ): void {
+    const meta = this._currentCheckpointMeta();
+    for (const [mode, payload] of entries) {
+      if (
+        mode === "values" &&
+        meta?.checkpoint != null &&
+        !this.stream.modes.has("checkpoints")
+      ) {
+        this.stream.push([
+          this.checkpointNamespace,
+          "checkpoints",
+          meta.checkpoint,
+        ]);
+      }
+      if (this.stream.modes.has(mode)) {
+        this.stream.push([this.checkpointNamespace, mode, payload]);
+      }
+    }
+  }
+
+  protected _putCheckpoint(
+    inputMetadata: Omit<CheckpointMetadata, "step" | "parents">
+  ) {
+    const exiting = this.checkpointMetadata === inputMetadata;
+    // Nothing ran since this checkpoint was loaded: putting it again would
+    // store it as its own parent.
+    if (exiting && this.checkpoint.id === this.checkpointIdSaved) return;
+
+    const doCheckpoint =
+      this.checkpointer != null && (this.durability !== "exit" || exiting);
+
+    const storeCheckpoint = (checkpoint: Checkpoint) => {
+      // store the previous checkpoint config for debug events
+      this.prevCheckpointConfig = this.checkpointConfig?.configurable
+        ?.checkpoint_id
+        ? this.checkpointConfig
+        : undefined;
+
+      // child graphs keep at most one checkpoint per parent checkpoint
+      // this is achieved by writing child checkpoints as progress is made
+      // (so that error recovery / resuming from interrupt don't lose work)
+      // but doing so always with an id equal to that of the parent checkpoint
+      this.checkpointConfig = patchConfigurable(this.checkpointConfig, {
+        [CONFIG_KEY_CHECKPOINT_NS]:
+          this.config.configurable?.checkpoint_ns ?? "",
+      });
+
+      const channelVersions = { ...this.checkpoint.channel_versions };
+      const newVersions = getNewChannelVersions(
+        this.checkpointPreviousVersions,
+        channelVersions
+      );
+      this.checkpointPreviousVersions = channelVersions;
+      // save it, without blocking
+      // if there's a previous checkpoint save in progress, wait for it
+      // ensuring checkpointers receive checkpoints in order
+      void this._checkpointerPutAfterPrevious({
+        config: { ...this.checkpointConfig },
+        checkpoint: copyCheckpoint(checkpoint),
+        metadata: { ...this.checkpointMetadata },
+        newVersions,
+      });
+      this.checkpointConfig = {
+        ...this.checkpointConfig,
+        configurable: {
+          ...this.checkpointConfig.configurable,
+          checkpoint_id: this.checkpoint.id,
+        },
+      };
+    };
+
+    // The exit call must NOT bump the counters again (the last intermediate
+    // call already counted the final superstep) or it would double-count.
+    let newCounters: Record<string, [number, number]>;
+    if (!exiting) {
+      newCounters = advanceDeltaCounters(
+        this.deltaChannels,
+        this.updatedChannels ?? new Set<string>(),
+        this.checkpointMetadata.counters_since_delta_snapshot
+      );
+      this.checkpointMetadata = {
+        ...inputMetadata,
+        step: this.step,
+        parents: this.config.configurable?.[CONFIG_KEY_CHECKPOINT_MAP] ?? {},
+      };
+    } else {
+      newCounters = {
+        ...(this.checkpointMetadata.counters_since_delta_snapshot ?? {}),
+      };
+    }
+    if (this._deltaWritesVersioned) {
+      (this.checkpointMetadata as Record<string, unknown>)[
+        DELTA_WRITES_VERSIONED
+      ] = true;
+    }
+
+    const channelsToSnapshot = doCheckpoint
+      ? deltaChannelsToSnapshot(
+          this.deltaChannels,
+          newCounters,
+          this._deltaWritesVersioned
+            ? this.checkpoint.channel_versions
+            : undefined
+        )
+      : new Set<string>();
+    if (doCheckpoint) {
+      for (const ch of this._deltaChannelsForcedSnapshot)
+        channelsToSnapshot.add(ch);
+    }
+
+    // create new checkpoint
+    this.checkpoint = createCheckpoint(
+      this.checkpoint,
+      doCheckpoint ? this.channels : undefined,
+      this.step,
+      {
+        id: exiting ? this.checkpoint.id : undefined,
+        channelsToSnapshot,
+        storedVersions: this.checkpointPreviousVersions,
+        getNextVersion: doCheckpoint
+          ? (current) =>
+              this.checkpointerGetNextVersion(current as number | undefined)
+          : undefined,
+        triggerToNodes: this.triggerToNodes,
+      }
+    );
+
+    // Reset counters for channels that just snapshotted, and persist the
+    // non-zero remainder into metadata (or clear the field entirely).
+    for (const k of channelsToSnapshot) {
+      newCounters[k] = [0, 0];
+      this._deltaChannelsForcedSnapshot.delete(k);
+    }
+    const nonZero: Record<string, [number, number]> = {};
+    for (const k in newCounters) {
+      if (!Object.prototype.hasOwnProperty.call(newCounters, k)) continue;
+      const [u, s] = newCounters[k];
+      if (u !== 0 || s !== 0) nonZero[k] = [u, s];
+    }
+    if (Object.keys(nonZero).length > 0) {
+      this.checkpointMetadata.counters_since_delta_snapshot = nonZero;
+    } else {
+      delete this.checkpointMetadata.counters_since_delta_snapshot;
+    }
+
+    // Bail if no checkpointer
+    if (doCheckpoint) storeCheckpoint(this.checkpoint);
+
+    if (!exiting) {
+      // increment step
+      this.step += 1;
+    }
+  }
+
+  /**
+   * Stage the exit-mode accumulator of DeltaChannel writes so the final
+   * checkpoint can be reconstructed. In "exit" durability per-step writes are
+   * not persisted, so delta writes are accumulated across the run and anchored
+   * here — under the saved parent, or a freshly-created stub when this is a
+   * first run with no persisted parent. Channels that will snapshot in the
+   * final checkpoint are excluded (their full value lives in `channel_values`).
+   *
+   * Must run BEFORE the final `_putCheckpoint` so the stub branch can adjust
+   * `checkpointConfig` to anchor the final checkpoint on the stub.
+   */
+  protected async _putExitDeltaWrites(): Promise<void> {
+    if (
+      this._exitDeltaWrites === undefined ||
+      this._exitDeltaWrites.length === 0 ||
+      this.checkpointer == null ||
+      this._initialCheckpointConfig === undefined
+    ) {
+      return;
+    }
+
+    // A checkpoint a `checkpoint_id` addressed may already have children,
+    // which read the writes stored on it, so then the channels this run wrote
+    // snapshot instead.
+    if (this._hasPersistedParent && !this._loadedLatest) {
+      for (const [, , , ch] of this._exitDeltaWrites)
+        this._deltaChannelsForcedSnapshot.add(ch);
+    }
+
+    const counters =
+      this.checkpointMetadata.counters_since_delta_snapshot ?? {};
+    const channelsToSnapshot = deltaChannelsToSnapshot(
+      this.deltaChannels,
+      counters,
+      this._deltaWritesVersioned ? this.checkpoint.channel_versions : undefined
+    );
+    // Forced snapshots are taken by the final `_putCheckpoint` (which runs
+    // after this), so their accumulated exit writes must NOT also be replayed
+    // on top of that snapshot — exclude them.
+    for (const ch of this._deltaChannelsForcedSnapshot)
+      channelsToSnapshot.add(ch);
+
+    const pending = this._exitDeltaWrites.filter(
+      ([, , , ch]) => !channelsToSnapshot.has(ch)
+    );
+    if (pending.length === 0) return;
+
+    let anchorConfig: RunnableConfig;
+    if (this._hasPersistedParent) {
+      // _initialCheckpointConfig points at the saved parent checkpoint.
+      anchorConfig = this._initialCheckpointConfig;
+    } else {
+      // No persisted parent: create a stub empty checkpoint (no parent) and
+      // anchor on it, then point the final checkpoint at the stub.
+      const stubCp = emptyCheckpoint();
+      stubCp.id = this.checkpointIdSaved ?? stubCp.id;
+      stubCp.ts = new Date().toISOString();
+      const stubPutConfig = patchConfigurable(this._initialCheckpointConfig, {
+        [CONFIG_KEY_CHECKPOINT_ID]: undefined,
+      });
+      anchorConfig = patchConfigurable(this._initialCheckpointConfig, {
+        [CONFIG_KEY_CHECKPOINT_ID]: stubCp.id,
+      });
+      this._checkpointerPutAfterPrevious({
+        config: stubPutConfig,
+        checkpoint: stubCp,
+        metadata: { source: "loop", step: -2, parents: {} },
+        newVersions: {},
+      });
+      this.checkpointConfig = anchorConfig;
+    }
+
+    const anchorWriteConfig = patchConfigurable(anchorConfig, {
+      [CONFIG_KEY_CHECKPOINT_NS]: this.config.configurable?.checkpoint_ns ?? "",
+      [CONFIG_KEY_CHECKPOINT_ID]:
+        anchorConfig.configurable?.[CONFIG_KEY_CHECKPOINT_ID],
+    });
+
+    // The checkpoint's own superstep keeps its real task paths, so it
+    // interleaves with the writes a resume loaded from it. Its task ids stay
+    // synthetic: under the real id, a run whose final checkpoint fails to
+    // save would leave the resumed task looking done to the next resume.
+    // Later supersteps sort after every real task path and task id, in step
+    // order, so this holds whether a saver orders writes by task path
+    // (`writesSortKey`) or by task id only. `NULL_TASK_ID` keeps the empty
+    // path, where live execution applies input.
+    const grouped = new Map<string, PendingWrite<string>[]>();
+    const order: { key: string; tid: string; path: string }[] = [];
+    for (const [step, tid, path, ch, v] of pending) {
+      let synthTid: string;
+      let synthPath: string;
+      if (tid === NULL_TASK_ID) {
+        synthTid = exitDeltaTaskId(step, tid);
+        synthPath = "";
+      } else if (step === this._exitFirstStep) {
+        synthTid = exitDeltaTaskId(step, tid);
+        synthPath = path;
+      } else {
+        synthTid = exitDeltaLateTaskId(step, tid);
+        // `~~` sorts after every real path (which starts with a single `~`),
+        // in step order — `taskPathStr` gives the sign-aware 10-digit padding.
+        synthPath = `~~${taskPathStr(step)}${path}`;
+      }
+      const key = `${synthTid}\u0000${synthPath}`;
+      let group = grouped.get(key);
+      if (group === undefined) {
+        group = [];
+        grouped.set(key, group);
+        order.push({ key, tid: synthTid, path: synthPath });
+      }
+      group.push([ch, v]);
+    }
+    for (const { key, tid, path } of order) {
+      const saved = this.checkpointer.putWrites(
+        anchorWriteConfig,
+        grouped.get(key)!,
+        tid,
+        path
+      );
+      this._trackCheckpointerPromise(saved);
+      this._pendingDeltaWrites.push(saved);
+    }
+  }
+
+  protected _flushPendingWrites() {
+    if (this.checkpointer == null) return;
+    if (this.checkpointPendingWrites.length === 0) return;
+
+    // patch config
+    const config = patchConfigurable(this.checkpointConfig, {
+      [CONFIG_KEY_CHECKPOINT_NS]: this.config.configurable?.checkpoint_ns ?? "",
+      [CONFIG_KEY_CHECKPOINT_ID]: this.checkpoint.id,
+    });
+
+    // Writes loaded with the checkpoint are stored on it already. Saving them
+    // again can file them under new indexes, and then they apply twice.
+    const byTask: Record<string, PendingWrite<string>[]> = {};
+    for (const [tid, key, value] of this.checkpointPendingWrites) {
+      if (!this._writtenTaskIds.has(tid)) continue;
+      byTask[tid] ??= [];
+      byTask[tid].push([key, value]);
+    }
+
+    // submit writes to checkpointer
+    for (const [tid, ws] of Object.entries(byTask)) {
+      const task = this.tasks[tid];
+      this._trackCheckpointerPromise(
+        this.checkpointer.putWrites(
+          config,
+          ws,
+          tid,
+          task != null ? taskPathStr(task.path) : ""
+        )
+      );
+    }
+  }
+
+  /**
+   * Hands the writes loaded with the checkpoint back to the finished tasks
+   * among `tasks`. A failed or interrupted task keeps empty writes, so it
+   * reruns or goes to its error handler.
+   */
+  protected _reapplyWritesToSucceededNodes(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tasks: Record<string, PregelExecutableTask<any, any>>
+  ) {
+    for (const [tid, k, v] of this.checkpointPendingWrites) {
+      if (!isTaskOutput(k)) continue;
+      const task = tasks[tid];
+      if (task) {
+        task.writes.push([k, v]);
+        this._reappliedTaskIds.add(tid);
+      }
+    }
+  }
+
+  /** Ids of the interrupts still waiting for an answer: those of tasks with no output. */
+  protected _pendingInterruptIds(): Set<string> {
+    const finished = new Set(
+      this.checkpointPendingWrites
+        .filter(([, k]) => isTaskOutput(k))
+        .map(([tid]) => tid)
+    );
+    const interrupts = this.checkpointPendingWrites
+      .filter(([tid, k]) => k === INTERRUPT && !finished.has(tid))
+      .flatMap(([, , v]) => v) as Interrupt[];
+    return new Set(interrupts.flatMap(({ id }) => (id == null ? [] : [id])));
+  }
+
+  /**
+   * Strict resume mode: refuses a resume that names an interrupt that isn't
+   * pending, is an empty map, or is one value while several are pending.
+   */
+  protected _refuseUnmatchedResume(resume: unknown) {
+    const pending = this._pendingInterruptIds();
+    const pendingIds = [...pending].sort();
+    if (isPlainObject(resume) && Object.keys(resume).every(isXXH3)) {
+      const ids = Object.keys(resume);
+      if (ids.length === 0) {
+        throw new UnknownInterruptError("The resume map names no interrupt", {
+          reason: "empty_map",
+          pendingIds,
+        });
+      }
+      const unknown = ids.filter((id) => !pending.has(id)).sort();
+      if (unknown.length > 0) {
+        throw new UnknownInterruptError(
+          `Unknown or already-consumed interrupt: ${unknown[0]}`,
+          { reason: "not_pending", interruptIds: unknown, pendingIds }
+        );
+      }
+    } else if (pending.size > 1) {
+      throw new UnknownInterruptError(
+        "When there are multiple pending interrupts, you must specify the interrupt id when resuming.",
+        { reason: "ambiguous", pendingIds }
+      );
+    }
+  }
+
+  protected _matchWrites(
+    tasks: Record<string, PregelExecutableTask<string, string>>
+  ) {
+    this._reapplyWritesToSucceededNodes(tasks);
+    for (const task of Object.values(tasks)) {
+      if (task.writes.length > 0) {
+        this._outputWrites(task.id, task.writes, true);
+      }
+    }
+  }
+}

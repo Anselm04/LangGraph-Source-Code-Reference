@@ -1,0 +1,575 @@
+import { MongoDBStore } from "../store";
+import {
+  InvalidNamespaceError,
+  type PutOperation,
+} from "@langchain/langgraph-checkpoint";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+
+describe("MongoDBStore", () => {
+  let store: MongoDBStore;
+  let mockClient: any;
+  let mockDb: any;
+  let mockCollection: any;
+
+  beforeEach(() => {
+    const createFindCursor = () => ({
+      skip: vi.fn(() => ({
+        limit: vi.fn(() => ({
+          toArray: vi.fn().mockResolvedValue([]),
+        })),
+      })),
+      toArray: vi.fn().mockResolvedValue([]),
+    });
+
+    const collectionMock = {
+      updateOne: vi.fn().mockResolvedValue({ ok: 1 }),
+      findOne: vi.fn().mockResolvedValue(null),
+      findOneAndUpdate: vi.fn().mockResolvedValue(null),
+      find: vi.fn(() => createFindCursor()),
+      deleteOne: vi.fn().mockResolvedValue({ deletedCount: 1 }),
+      createIndex: vi.fn().mockResolvedValue("namespace_1_key_1"),
+      aggregate: vi.fn(() => ({
+        toArray: vi.fn().mockResolvedValue([]),
+      })),
+      bulkWrite: vi.fn().mockResolvedValue({ ok: 1 }),
+    };
+
+    mockDb = {
+      collection: vi.fn(() => collectionMock),
+    };
+
+    mockClient = {
+      appendMetadata: vi.fn(),
+      db: vi.fn(() => mockDb),
+    };
+
+    mockCollection = collectionMock;
+
+    store = new MongoDBStore({
+      client: mockClient as any,
+      dbName: "test",
+      collectionName: "store",
+    });
+  });
+
+  describe("put", () => {
+    it("should upsert a document", async () => {
+      await store.batch([{
+        namespace: ["documents", "user123"],
+        key: "doc1",
+        value: { title: "Test", content: "Hello" },
+      } as PutOperation]);
+
+      expect(mockCollection.bulkWrite).toHaveBeenCalled();
+      const calls = mockCollection.bulkWrite.mock.calls[0][0];
+      expect(calls).toHaveLength(1);
+      const { updateOne } = calls[0];
+      expect(updateOne.filter).toEqual({
+        namespace: ["documents", "user123"],
+        key: { $eq: "doc1" },
+      });
+      expect(updateOne.update.$set.value).toEqual({ title: "Test", content: "Hello" });
+      expect(updateOne.upsert).toBe(true);
+    });
+
+    it("should delete document when value is null", async () => {
+      await store.batch([{
+        namespace: ["documents", "user123"],
+        key: "doc1",
+        value: null,
+      } as PutOperation]);
+
+      expect(mockCollection.bulkWrite).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            deleteOne: expect.objectContaining({
+              filter: { namespace: ["documents", "user123"], key: { $eq: "doc1" } },
+            }),
+          }),
+        ])
+      );
+    });
+
+    it("should reject a string namespace on delete", async () => {
+      await expect(store.delete("documents" as any, "doc1")).rejects.toThrow(
+        "Namespace must be an array"
+      );
+      expect(mockCollection.bulkWrite).not.toHaveBeenCalled();
+    });
+
+    it("should throw InvalidNamespaceError for empty namespace", async () => {
+      await expect(
+        store.batch([{ namespace: [], key: "doc1", value: { title: "Test" } } as PutOperation])
+      ).rejects.toThrow("Namespace cannot be empty");
+    });
+
+    it("should throw InvalidNamespaceError for namespace with periods", async () => {
+      await expect(
+        store.batch([{ namespace: ["docs.invalid"], key: "doc1", value: { title: "Test" } } as PutOperation])
+      ).rejects.toThrow("Namespace labels cannot contain periods");
+    });
+
+    it("should throw InvalidNamespaceError for 'langgraph' root label", async () => {
+      await expect(
+        store.batch([{ namespace: ["langgraph", "data"], key: "doc1", value: { title: "Test" } } as PutOperation])
+      ).rejects.toThrow('Root label for namespace cannot be "langgraph"');
+    });
+
+    it.each([
+      ["a colon", ["docs:invalid"]],
+      ["a NUL byte", ["docs\x00invalid"]],
+    ])("should throw InvalidNamespaceError for a label with %s", async (_name, namespace) => {
+      await expect(
+        store.batch([{ namespace, key: "doc1", value: { title: "Test" } } as PutOperation])
+      ).rejects.toThrow(InvalidNamespaceError);
+      expect(mockCollection.bulkWrite).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("get", () => {
+    it("should return null if document not found", async () => {
+      mockCollection.findOne.mockResolvedValueOnce(null);
+      const results = await store.batch([{ namespace: ["documents"], key: "missing" }]);
+      expect(results[0]).toBeNull();
+    });
+
+    it("should return item with value, key, namespace, and timestamps", async () => {
+      const now = new Date();
+      mockCollection.findOne.mockResolvedValueOnce({
+        namespace: ["documents"], key: "doc1", value: { title: "Test" },
+        createdAt: now, updatedAt: now,
+      });
+
+      const results = await store.batch([{ namespace: ["documents"], key: "doc1" }]);
+      expect(results[0]).toEqual({
+        namespace: ["documents"], key: "doc1", value: { title: "Test" },
+        createdAt: now, updatedAt: now,
+      });
+    });
+
+    it("should compare an object key as a value", async () => {
+      await store.get(["profiles"], { $ne: "alice" } as any);
+      expect(mockCollection.findOne).toHaveBeenCalledWith({
+        namespace: ["profiles"],
+        key: { $eq: { $ne: "alice" } },
+      });
+    });
+
+    it.each([
+      ["a string", "profiles"],
+      ["an object", { $exists: true }],
+    ])("should reject %s as a namespace passed to batch()", async (_name, namespace) => {
+      await expect(store.batch([{ namespace, key: "alice" } as any])).rejects.toThrow(
+        "Namespace must be an array"
+      );
+      expect(mockCollection.findOne).not.toHaveBeenCalled();
+    });
+
+    it("should compare an object key as a value when refreshing the TTL on read", async () => {
+      const ttlStore = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        ttl: { defaultTtl: 60, refreshOnRead: true },
+      });
+
+      await ttlStore.get(["profiles"], { $ne: "alice" } as any);
+      expect(mockCollection.findOneAndUpdate).toHaveBeenCalledWith(
+        { namespace: ["profiles"], key: { $eq: { $ne: "alice" } } },
+        expect.anything(),
+        expect.anything()
+      );
+    });
+  });
+
+  describe("search", () => {
+    it("should build prefix query using dot-notation", async () => {
+      const findMock = vi.fn(() => ({
+        skip: vi.fn(() => ({
+          limit: vi.fn(() => ({
+            toArray: vi.fn().mockResolvedValue([]),
+          })),
+        })),
+      }));
+      mockCollection.find = findMock;
+
+      await store.batch([
+        { namespacePrefix: ["users", "profiles"], filter: {}, limit: 10, offset: 0 },
+      ]);
+
+      expect(findMock.mock.calls[0][0]).toEqual({
+        "namespace.0": { $eq: "users" },
+        "namespace.1": { $eq: "profiles" },
+      });
+    });
+
+    it("should compare a filter $eq operand as a value", async () => {
+      await store.search(["products"], { filter: { name: { $eq: { $regex: "" } } } });
+      expect(mockCollection.find).toHaveBeenCalledWith({
+        "namespace.0": { $eq: "products" },
+        "value.name": { $eq: { $regex: "" } },
+      });
+    });
+
+    it("should throw when query is provided without indexConfig", async () => {
+      await expect(
+        store.batch([{ namespacePrefix: ["docs"], query: "find something", limit: 10, offset: 0 }])
+      ).rejects.toThrow(/indexConfig/i);
+    });
+  });
+
+  describe("listNamespaces", () => {
+    it("should return empty array if no documents exist", async () => {
+      mockCollection.aggregate = vi.fn(() => ({
+        toArray: vi.fn().mockResolvedValue([]),
+      }));
+
+      const results = await store.batch([{ limit: 100, offset: 0 }]);
+      expect(results[0]).toEqual([]);
+    });
+
+    it("should build prefix matchCondition pipeline", async () => {
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await store.batch([{
+        matchConditions: [{ matchType: "prefix" as const, path: ["users"] }],
+        limit: 100, offset: 0,
+      }]);
+
+      const matchStage = capturedPipelines[0].find((s: any) => s.$match);
+      expect(matchStage).toEqual({
+        $match: {
+          $expr: {
+            $and: [
+              { $eq: [{ $arrayElemAt: ["$namespace", 0] }, { $literal: "users" }] },
+              { $gte: [{ $size: "$namespace" }, 1] },
+            ],
+          },
+        },
+      });
+    });
+
+    it("should build suffix matchCondition pipeline", async () => {
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await store.batch([{
+        matchConditions: [{ matchType: "suffix" as const, path: ["v1"] }],
+        limit: 100, offset: 0,
+      }]);
+
+      const matchStage = capturedPipelines[0].find((s: any) => s.$match);
+      expect(matchStage).toEqual({
+        $match: {
+          $expr: {
+            $and: [
+              { $eq: [{ $arrayElemAt: ["$namespace", -1] }, { $literal: "v1" }] },
+              { $gte: [{ $size: "$namespace" }, 1] },
+            ],
+          },
+        },
+      });
+    });
+
+    it("should skip wildcard positions in matchCondition pipeline", async () => {
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await store.batch([{
+        matchConditions: [{ matchType: "prefix" as const, path: ["users", "*", "settings"] }],
+        limit: 100, offset: 0,
+      }]);
+
+      const matchStage = capturedPipelines[0].find((s: any) => s.$match);
+      expect(matchStage).toEqual({
+        $match: {
+          $expr: {
+            $and: [
+              { $eq: [{ $arrayElemAt: ["$namespace", 0] }, { $literal: "users" }] },
+              { $eq: [{ $arrayElemAt: ["$namespace", 2] }, { $literal: "settings" }] },
+              { $gte: [{ $size: "$namespace" }, 3] },
+            ],
+          },
+        },
+      });
+    });
+
+    it.each([
+      ["a non-string label", { matchConditions: [{ matchType: "prefix", path: [{ $literal: "a" }] }] }],
+      ["a numeric label", { matchConditions: [{ matchType: "suffix", path: [1] }] }],
+      ["a path that is not an array", { matchConditions: [{ matchType: "prefix", path: "users" }] }],
+      // Same rules as listNamespaces(): labels can't contain "." or be empty.
+      ["a label with a period", { matchConditions: [{ matchType: "prefix", path: ["a.b"] }] }],
+      ["an empty label", { matchConditions: [{ matchType: "suffix", path: [""] }] }],
+      ["an unknown match type", { matchConditions: [{ matchType: "contains", path: ["users"] }] }],
+      ["a non-numeric maxDepth", { maxDepth: { $literal: 1 } }],
+      ["a negative maxDepth", { maxDepth: -1 }],
+      ["a fractional maxDepth", { maxDepth: 1.5 }],
+    ])("should reject %s in a batched operation", async (_name, op) => {
+      await expect(
+        store.batch([{ limit: 100, offset: 0, ...op } as any])
+      ).rejects.toThrow(InvalidNamespaceError);
+      expect(mockCollection.aggregate).not.toHaveBeenCalled();
+    });
+
+    it("should reject a non-numeric maxDepth passed to listNamespaces", async () => {
+      await expect(
+        store.listNamespaces({ maxDepth: { $literal: 1 } as any })
+      ).rejects.toThrow(InvalidNamespaceError);
+      expect(mockCollection.aggregate).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["an empty prefix", { matchConditions: [{ matchType: "prefix", path: [] }] }],
+      ["a 'langgraph' root label", { matchConditions: [{ matchType: "prefix", path: ["langgraph"] }] }],
+      ["a wildcard label", { matchConditions: [{ matchType: "suffix", path: ["*"] }] }],
+      ["a maxDepth", { maxDepth: 2 }],
+      ["a maxDepth of 0", { maxDepth: 0 }],
+    ])("should accept %s in a batched operation", async (_name, op) => {
+      await expect(
+        store.batch([{ limit: 100, offset: 0, ...op } as any])
+      ).resolves.toEqual([[]]);
+      expect(mockCollection.aggregate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("batch", () => {
+    it("should execute mixed operations in one batch", async () => {
+      const now = new Date();
+      mockCollection.findOne.mockResolvedValueOnce({
+        namespace: ["batch"], key: "item1", value: { num: 1 },
+        createdAt: now, updatedAt: now,
+      });
+
+      const results = await store.batch([
+        { namespace: ["batch"], key: "item1", value: { num: 1 } } as PutOperation,
+        { namespace: ["batch"], key: "item2", value: { num: 2 } } as PutOperation,
+        { namespace: ["batch"], key: "item1" },
+      ]);
+
+      expect(results[0]).toBeUndefined();
+      expect(results[1]).toBeUndefined();
+      expect(results[2]?.value).toEqual({ num: 1 });
+    });
+  });
+
+  describe("vector search", () => {
+    it("should store embeddings on put in manual mode", async () => {
+      const embedDocuments = vi.fn().mockResolvedValue([[0.1, 0.2]]);
+      const storeWithEmbeddings = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        embeddings: { embedQuery: vi.fn().mockResolvedValue([0.1, 0.2]), embedDocuments } as any,
+        indexConfig: { name: "test_index", dims: 2 },
+      });
+
+      await storeWithEmbeddings.batch([{
+        namespace: ["memories", "alice"],
+        key: "mem1",
+        value: { text: "hello world" },
+      } as PutOperation]);
+
+      expect(embedDocuments).toHaveBeenCalledWith([JSON.stringify({ text: "hello world" })]);
+      const calls = mockCollection.bulkWrite.mock.calls[0][0];
+      const doc = calls[0].updateOne.update.$set;
+      expect(doc.embedding).toEqual([0.1, 0.2]);
+      expect(doc.namespacePath).toEqual(["memories", "memories/alice"]);
+    });
+
+    it("should not write embedding field on put in auto mode", async () => {
+      const storeAuto = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "test_index", model: "voyage-4", path: "value.content" },
+      });
+
+      await storeAuto.batch([{
+        namespace: ["memories", "alice"],
+        key: "mem1",
+        value: { content: "hello world" },
+      } as PutOperation]);
+
+      const calls = mockCollection.bulkWrite.mock.calls[0][0];
+      const doc = calls[0].updateOne.update.$set;
+      // Auto mode: no embedding field written, MongoDB reads value.content directly
+      expect(doc.embedding).toBeUndefined();
+      expect(doc.value).toEqual({ content: "hello world" });
+      expect(doc.namespacePath).toEqual(["memories", "memories/alice"]);
+    });
+
+    it("should skip embedding when op.index is false", async () => {
+      const embedDocuments = vi.fn().mockResolvedValue([]);
+      const storeWithEmbeddings = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        embeddings: { embedQuery: vi.fn(), embedDocuments } as any,
+        indexConfig: { name: "test_index", dims: 2 },
+      });
+
+      await storeWithEmbeddings.batch([{
+        namespace: ["memories", "alice"],
+        key: "mem1",
+        value: { text: "hello world" },
+        index: false,
+      } as PutOperation]);
+
+      expect(embedDocuments).not.toHaveBeenCalled();
+      const calls = mockCollection.bulkWrite.mock.calls[0][0];
+      const doc = calls[0].updateOne.update.$set;
+      expect(doc.embedding).toBeUndefined();
+    });
+
+    it("should use queryVector in manual mode search", async () => {
+      const embedQuery = vi.fn().mockResolvedValue([0.1, 0.2]);
+      const storeWithEmbeddings = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        embeddings: { embedQuery, embedDocuments: vi.fn() } as any,
+        indexConfig: { name: "test_index", dims: 2 },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeWithEmbeddings.batch([{
+        namespacePrefix: ["memories"],
+        query: "find something",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      expect(embedQuery).toHaveBeenCalledWith("find something");
+      const vectorSearchStage = capturedPipelines[0][0].$vectorSearch;
+      expect(vectorSearchStage.queryVector).toEqual([0.1, 0.2]);
+      expect(vectorSearchStage.query).toBeUndefined();
+    });
+
+    it("should use query.text in auto mode search", async () => {
+      const storeAuto = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "test_index", model: "voyage-4" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAuto.batch([{
+        namespacePrefix: ["memories"],
+        query: "find something",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      const vectorSearchStage = capturedPipelines[0][0].$vectorSearch;
+      expect(vectorSearchStage.query).toEqual({ text: "find something" });
+      expect(vectorSearchStage.queryVector).toBeUndefined();
+    });
+
+    it("should include namespacePath filter in $vectorSearch", async () => {
+      const storeAuto = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "test_index", model: "voyage-4" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAuto.batch([{
+        namespacePrefix: ["memories", "alice"],
+        query: "find something",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      const vectorSearchStage = capturedPipelines[0][0].$vectorSearch;
+      expect(vectorSearchStage.filter).toEqual({ namespacePath: "memories/alice" });
+    });
+
+    it("should throw when query is provided without indexConfig", async () => {
+      await expect(
+        store.batch([{ namespacePrefix: ["docs"], query: "find something", limit: 10, offset: 0 }])
+      ).rejects.toThrow(/indexConfig/i);
+    });
+
+    // Regression: namespacePath is string-joined, so a label containing "/"
+    // (["team/alice"]) matches another namespace's path (["team", "alice"]).
+    // The real namespace array must be re-checked before pagination.
+    it("should re-check the namespace array before $skip/$limit", async () => {
+      const storeAuto = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "test_index", model: "voyage-4" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAuto.batch([
+        { namespacePrefix: ["team/alice"], query: "profile", limit: 10, offset: 5 },
+        { namespacePrefix: ["team", "alice"], query: "profile", limit: 10, offset: 5 },
+      ]);
+
+      for (const [pipeline, expectedMatch] of [
+        [capturedPipelines[0], { "namespace.0": { $eq: "team/alice" } }],
+        [capturedPipelines[1], { "namespace.0": { $eq: "team" }, "namespace.1": { $eq: "alice" } }],
+      ] as const) {
+        const stages = pipeline.map((stage: any) => Object.keys(stage)[0]);
+        const matchIdx = stages.indexOf("$match");
+        expect(pipeline[matchIdx].$match).toEqual(expectedMatch);
+        expect(matchIdx).toBeGreaterThan(stages.indexOf("$vectorSearch"));
+        expect(matchIdx).toBeLessThan(stages.indexOf("$skip"));
+        expect(matchIdx).toBeLessThan(stages.indexOf("$limit"));
+      }
+    });
+
+    it("should not add a namespace $match for an empty prefix", async () => {
+      const storeAuto = new MongoDBStore({
+        client: mockClient as any,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "test_index", model: "voyage-4" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAuto.batch([{ namespacePrefix: [], query: "profile", limit: 10, offset: 0 }]);
+
+      expect(capturedPipelines[0].some((stage: any) => "$match" in stage)).toBe(false);
+    });
+  });
+});
