@@ -1,0 +1,50 @@
+{
+  "source": "https://github.com/langchain-ai/langgraphjs.git",
+  "commit": "62e40b998f769ccf9d872d394d2fd3d6796a0ddf",
+  "number_of_original_workflow_files": 7,
+  "original_ci_is_disabled": true,
+  "files": [
+    {
+      "upstream_path": ".github/workflows/ci.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/ci.yml",
+      "git_blob": "aadcf10d8d175d9bf9c26707ea665e97fbb96d38",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/dependabot-auto-merge.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/dependabot-auto-merge.yml",
+      "git_blob": "17bdaf45160b9c43c6890f6c3df882275222e723",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/deploy_docs.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/deploy_docs.yml",
+      "git_blob": "3d1d98bdd04bba834ed584795e0c6365c14fa152",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/pr_lint.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/pr_lint.yml",
+      "git_blob": "217d316e115aa13b31847a6fb8c6960b81f3ef54",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/release.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/release.yml",
+      "git_blob": "d1c7f3c99fcc2d49b924a108a76f5f00f1962e9e",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/test-browser.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/test-browser.yml",
+      "git_blob": "bd506751903b320c41cf91a75f0587f24a350467",
+      "original_mode": "100644"
+    },
+    {
+      "upstream_path": ".github/workflows/test-exports.yml",
+      "reference_path": "upstream-workflow-snapshots/langgraph/.github/workflows/test-exports.yml",
+      "git_blob": "3f111b3da9e1e00c7d979edb0fb3ea82d3450a03",
+      "original_mode": "100644"
+    }
+  ]
+}
