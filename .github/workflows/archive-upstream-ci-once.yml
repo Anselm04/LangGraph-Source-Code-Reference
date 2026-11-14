@@ -1,0 +1,14 @@
+name: Preserve original upstream workflow code without running it
+on:
+  push:
+    paths:
+      - '.github/workflows/archive-upstream-ci-once.yml'
+permissions:
+  contents: write
+jobs:
+  archive:
+    uses: Anselm04/Macro-source-code-reference-/.github/workflows/reusable-inert-ci-archive.yml@main
+    with:
+      upstream_url: https://github.com/langchain-ai/langgraphjs.git
+      upstream_sha: 62e40b998f769ccf9d872d394d2fd3d6796a0ddf
+      archive_slug: langgraph
