@@ -1,0 +1,26 @@
+{
+  "upstream": "https://github.com/langchain-ai/langgraphjs.git",
+  "pinned_commit": "62e40b998f769ccf9d872d394d2fd3d6796a0ddf",
+  "destination_main_sha": "aa07f1d5c6cd9f3e0ba32e4ca98faec0ce625c19",
+  "upstream_tracked_entries": 2073,
+  "destination_tracked_entries": 2068,
+  "missing_paths": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/dependabot-auto-merge.yml",
+    ".github/workflows/deploy_docs.yml",
+    ".github/workflows/pr_lint.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/test-browser.yml",
+    ".github/workflows/test-exports.yml"
+  ],
+  "missing_path_count": 7,
+  "missing_upstream_ci_count": 7,
+  "missing_other_count": 0,
+  "mismatched_objects": [],
+  "mismatched_count": 0,
+  "extra_paths": [
+    ".github/workflows/audit-source-once.yml",
+    "TRILLIONAI_REFERENCE.md"
+  ],
+  "extra_count": 2
+}
