@@ -1,0 +1,406 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { AsyncCaller } from "./async_caller.js";
+
+describe("AsyncCaller", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each(["AbortError", "TimeoutError"])(
+    "does not retry a native %s",
+    async (name) => {
+      vi.useFakeTimers();
+      const error = new DOMException("The operation was aborted", name);
+      const failingCallable = vi.fn(() => Promise.reject(error));
+      const result = new AsyncCaller({ maxRetries: 2 })
+        .call(failingCallable)
+        .catch((e) => e);
+
+      await vi.runAllTimersAsync();
+
+      expect(await result).toBe(error);
+      expect(failingCallable).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  describe("error handling with undefined/null message", () => {
+    it("should handle errors with undefined message without crashing", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      // Create an error without a message property
+      const errorWithoutMessage = new Error();
+      // @ts-expect-error - deliberately removing message for testing
+      delete errorWithoutMessage.message;
+
+      const failingCallable = vi.fn(() => Promise.reject(errorWithoutMessage));
+
+      // The key test: this should not crash with "Cannot read properties of undefined"
+      await expect(caller.call(failingCallable)).rejects.toThrow();
+      expect(failingCallable).toHaveBeenCalled();
+    });
+
+    it("should handle errors with null message without crashing", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      const errorWithNullMessage = new Error();
+      // @ts-expect-error - deliberately setting message to null for testing
+      errorWithNullMessage.message = null;
+
+      const failingCallable = vi.fn(() => Promise.reject(errorWithNullMessage));
+
+      // The key test: this should not crash with "Cannot read properties of null"
+      await expect(caller.call(failingCallable)).rejects.toThrow();
+      expect(failingCallable).toHaveBeenCalled();
+    });
+
+    it("should handle empty error object without crashing", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      // Create a minimal error-like object
+      const minimalError = { name: "Error" };
+
+      const failingCallable = vi.fn(() => Promise.reject(minimalError));
+
+      // Should not crash
+      await expect(caller.call(failingCallable)).rejects.toThrow();
+    });
+  });
+
+  describe("successful calls", () => {
+    it("should return result from successful call", async () => {
+      const caller = new AsyncCaller({ maxRetries: 3 });
+
+      const successfulCallable = vi.fn(() =>
+        Promise.resolve({ data: "success" })
+      );
+
+      const result = await caller.call(successfulCallable);
+      expect(result).toEqual({ data: "success" });
+      expect(successfulCallable).toHaveBeenCalledTimes(1);
+    });
+
+    it("should pass arguments to callable", async () => {
+      const caller = new AsyncCaller({ maxRetries: 3 });
+
+      const successfulCallable = vi.fn((a: number, b: string) =>
+        Promise.resolve(`${a}-${b}`)
+      );
+
+      const result = await caller.call(successfulCallable, 42, "test");
+      expect(result).toBe("42-test");
+      expect(successfulCallable).toHaveBeenCalledWith(42, "test");
+    });
+  });
+
+  describe("fetch method", () => {
+    it("should use custom fetch when provided", async () => {
+      const mockFetch = vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          text: () => Promise.resolve(""),
+          json: () => Promise.resolve({}),
+          headers: new Headers(),
+        } as Response)
+      );
+
+      const caller = new AsyncCaller({
+        maxRetries: 0,
+        fetch: mockFetch,
+      });
+
+      await caller.fetch("http://example.com/api");
+
+      expect(mockFetch).toHaveBeenCalledWith("http://example.com/api");
+    });
+
+    it("should reject non-ok responses", async () => {
+      const mockFetch = vi.fn(() =>
+        Promise.resolve({
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          text: () => Promise.resolve("Server error"),
+          headers: new Headers(),
+        } as Response)
+      );
+
+      const caller = new AsyncCaller({
+        maxRetries: 0,
+        fetch: mockFetch,
+      });
+
+      await expect(caller.fetch("http://example.com/api")).rejects.toThrow(
+        /HTTP 500/
+      );
+    });
+  });
+
+  describe("callWithOptions", () => {
+    it("should work without signal option", async () => {
+      const caller = new AsyncCaller({ maxRetries: 3 });
+
+      const successfulCallable = vi.fn(() => Promise.resolve("success"));
+
+      const result = await caller.callWithOptions({}, successfulCallable);
+      expect(result).toBe("success");
+    });
+
+    it("should pass through to call when no signal provided", async () => {
+      const caller = new AsyncCaller({ maxRetries: 3 });
+
+      const successfulCallable = vi.fn((x: number) => Promise.resolve(x * 2));
+
+      const result = await caller.callWithOptions({}, successfulCallable, 21);
+      expect(result).toBe(42);
+      expect(successfulCallable).toHaveBeenCalledWith(21);
+    });
+  });
+
+  describe("HTTP error handling", () => {
+    it("should convert response-like objects to HTTPError", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      // Simulate a response object being rejected (like from fetch)
+      const responseError = {
+        status: 404,
+        statusText: "Not Found",
+        text: () => Promise.resolve("Resource not found"),
+      };
+
+      const failingCallable = vi.fn(() => Promise.reject(responseError));
+
+      await expect(caller.call(failingCallable)).rejects.toThrow(/HTTP 404/);
+    });
+
+    it("should include response text in HTTPError message", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      const responseError = {
+        status: 400,
+        statusText: "Bad Request",
+        text: () => Promise.resolve("Invalid parameters"),
+      };
+
+      const failingCallable = vi.fn(() => Promise.reject(responseError));
+
+      await expect(caller.call(failingCallable)).rejects.toThrow(
+        "HTTP 400: Invalid parameters"
+      );
+    });
+
+    it("should attach error.response without onFailedResponseHook", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      const responseError = {
+        status: 404,
+        statusText: "Not Found",
+        text: () => Promise.resolve("missing"),
+      };
+
+      const failingCallable = vi.fn(() => Promise.reject(responseError));
+
+      await expect(caller.call(failingCallable)).rejects.toMatchObject({
+        status: 404,
+        response: responseError,
+      });
+    });
+
+    it("should not attach a response to failures that carry none", async () => {
+      const caller = new AsyncCaller({ maxRetries: 0 });
+
+      // Only a Response rejection becomes an HTTPError, so these keep no
+      // `response`: a generic failure is rethrown as-is, and a connection
+      // failure is replaced by ConnectionError.
+      for (const failure of [
+        new TypeError("boom"),
+        new TypeError("fetch failed"),
+      ]) {
+        const error = await caller
+          .call(vi.fn(() => Promise.reject(failure)))
+          .catch((caught) => caught);
+
+        expect(error).not.toHaveProperty("response");
+        expect(error).not.toHaveProperty("status");
+      }
+    });
+
+    it("should retry connection errors and throw ConnectionError when retries are exhausted", async () => {
+      const caller = new AsyncCaller({ maxRetries: 1 });
+
+      const failingCallable = vi.fn(() =>
+        Promise.reject(new Error("fetch failed: connect ECONNREFUSED"))
+      );
+
+      await expect(caller.call(failingCallable)).rejects.toMatchObject({
+        name: "ConnectionError",
+        message: expect.stringContaining(
+          "Unable to connect to LangGraph server"
+        ),
+      });
+      expect(failingCallable).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("retry policy by HTTP method", () => {
+    const unavailable = () =>
+      new Response("unavailable", { status: 503, statusText: "Unavailable" });
+    const ok = () => new Response("{}", { status: 200 });
+    // Node's fetch (undici) rejects with the socket error on `cause`.
+    const fetchFailed = (code: string) =>
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error(`connect ${code}`), { code }),
+      });
+
+    async function settle<T>(promise: Promise<T>) {
+      const result = promise.catch((error) => error);
+      await vi.runAllTimersAsync();
+      return result;
+    }
+
+    it.each(["POST", "PATCH", "post"])(
+      "does not retry a %s that got a 5xx",
+      async (method) => {
+        vi.useFakeTimers();
+        const fetch = vi.fn(() => Promise.resolve(unavailable()));
+        const caller = new AsyncCaller({ maxRetries: 2, fetch });
+
+        const error = await settle(
+          caller.fetch("http://example.com/runs", { method })
+        );
+
+        expect(error).toMatchObject({ status: 503 });
+        expect(fetch).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it.each([undefined, "GET", "HEAD", "OPTIONS", "PUT", "DELETE"])(
+      "retries a %s that got a 5xx",
+      async (method) => {
+        vi.useFakeTimers();
+        const fetch = vi
+          .fn()
+          .mockResolvedValueOnce(unavailable())
+          .mockResolvedValueOnce(ok());
+        const caller = new AsyncCaller({ maxRetries: 2, fetch });
+
+        const response = await settle(
+          caller.fetch("http://example.com/runs", { method })
+        );
+
+        expect(response.status).toBe(200);
+        expect(fetch).toHaveBeenCalledTimes(2);
+      }
+    );
+
+    it("reads the method of a Request input", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn(() => Promise.resolve(unavailable()));
+      const caller = new AsyncCaller({ maxRetries: 2, fetch });
+
+      await settle(
+        caller.fetch(new Request("http://example.com/runs", { method: "POST" }))
+      );
+
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries a POST whose connection was refused", async () => {
+      vi.useFakeTimers();
+      const fetch = vi
+        .fn()
+        .mockRejectedValueOnce(fetchFailed("ECONNREFUSED"))
+        .mockResolvedValueOnce(ok());
+      const caller = new AsyncCaller({ maxRetries: 2, fetch });
+
+      const response = await settle(
+        caller.fetch("http://example.com/runs", { method: "POST" })
+      );
+
+      expect(response.status).toBe(200);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry a POST whose connection failed after it was sent", async () => {
+      vi.useFakeTimers();
+      const fetch = vi.fn(() => Promise.reject(fetchFailed("ECONNRESET")));
+      const caller = new AsyncCaller({ maxRetries: 2, fetch });
+
+      const error = await settle(
+        caller.fetch("http://example.com/runs", { method: "POST" })
+      );
+
+      expect(error).toMatchObject({ name: "ConnectionError" });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("applies the method passed to callWithOptions", async () => {
+      vi.useFakeTimers();
+      const callable = vi.fn(() => Promise.reject(unavailable()));
+      const caller = new AsyncCaller({ maxRetries: 2 });
+
+      const error = await settle(
+        caller.callWithOptions({ method: "POST" }, callable)
+      );
+
+      expect(error).toMatchObject({ status: 503 });
+      expect(callable).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("onFailedResponseHook", () => {
+    it("should call onFailedResponseHook when provided and request fails with response", async () => {
+      const onFailedResponseHook = vi.fn(() => Promise.resolve(false));
+
+      const caller = new AsyncCaller({
+        maxRetries: 0,
+        onFailedResponseHook,
+      });
+
+      const mockResponse = {
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        text: () => Promise.resolve("Service down"),
+      };
+
+      const failingCallable = vi.fn(() => Promise.reject(mockResponse));
+
+      await expect(caller.call(failingCallable)).rejects.toThrow(/HTTP 503/);
+    });
+  });
+
+  describe("maxConcurrency", () => {
+    it("should default to Infinity for maxConcurrency", async () => {
+      const caller = new AsyncCaller({});
+
+      // Just verify we can create a caller with default options
+      expect(caller).toBeDefined();
+    });
+
+    it("should respect maxConcurrency setting", async () => {
+      const caller = new AsyncCaller({ maxConcurrency: 1 });
+
+      const order: number[] = [];
+      const callable = vi.fn(async (id: number) => {
+        order.push(id);
+        await new Promise((resolve) => {
+          setTimeout(resolve, 10);
+        });
+        return id;
+      });
+
+      // Start multiple calls - with maxConcurrency=1, they should run sequentially
+      const results = await Promise.all([
+        caller.call(callable, 1),
+        caller.call(callable, 2),
+        caller.call(callable, 3),
+      ]);
+
+      expect(results).toEqual([1, 2, 3]);
+      expect(order).toEqual([1, 2, 3]); // Should run in order due to concurrency limit
+    });
+  });
+});

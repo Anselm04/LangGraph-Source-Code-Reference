@@ -1,0 +1,142 @@
+import {
+  normalizeHitlInterruptPayload,
+  normalizeHitlResponseForServer,
+} from "./hitl-interrupt-payload.js";
+import { serializeUpdateMessages } from "./optimistic-input.js";
+import { filterOutHeadlessToolInterrupts } from "../headless-tools.js";
+import { Interrupt, ThreadState } from "../schema.js";
+import type { Command } from "../types.js";
+
+/** The `__interrupt__` list of `values`, or `undefined` when it has none. */
+export function valuesInterrupts<InterruptType = unknown>(
+  values: unknown
+): Interrupt<InterruptType>[] | undefined {
+  return typeof values === "object" &&
+    values != null &&
+    "__interrupt__" in values &&
+    Array.isArray(values.__interrupt__)
+    ? (values.__interrupt__ as Interrupt<InterruptType>[])
+    : undefined;
+}
+
+/**
+ * The command that resumes interrupts with answers by id, with the state
+ * update and the node to go to that come with them.
+ */
+export function resumeCommand(
+  responses: Record<string, unknown>,
+  options: { update?: Command["update"]; goto?: Command["goto"] },
+  messagesKey: string
+): Command {
+  return {
+    resume: Object.fromEntries(
+      Object.entries(responses).map(([id, response]) => [
+        id,
+        normalizeHitlResponseForServer(response),
+      ])
+    ),
+    update:
+      options.update == null
+        ? options.update
+        : serializeUpdateMessages(options.update, messagesKey),
+    goto: options.goto,
+  };
+}
+
+/**
+ * Normalizes HITL interrupt payloads to expose camelCase fields plus deprecated
+ * snake_case aliases for compatibility during migration.
+ */
+export function normalizeInterruptForClient<T = unknown>(
+  interrupt: Interrupt<T>
+): Interrupt<T> {
+  if (interrupt.value === undefined) {
+    return interrupt;
+  }
+  return {
+    ...interrupt,
+    value: normalizeHitlInterruptPayload(interrupt.value) as T,
+  };
+}
+
+/**
+ * Applies {@link normalizeInterruptForClient} to each interrupt.
+ */
+export function normalizeInterruptsList<T = unknown>(
+  interrupts: Interrupt<T>[]
+): Interrupt<T>[] {
+  return interrupts.map((i) => normalizeInterruptForClient(i));
+}
+
+export function userFacingInterruptsFromValuesArray<InterruptType = unknown>(
+  valueInterrupts: Interrupt<InterruptType>[]
+): Interrupt<InterruptType>[] {
+  if (valueInterrupts.length === 0) return [{ when: "breakpoint" }];
+
+  const filtered = filterOutHeadlessToolInterrupts(valueInterrupts);
+  if (filtered.length === 0) return [];
+
+  return normalizeInterruptsList(filtered as Interrupt<InterruptType>[]);
+}
+
+export function userFacingInterruptsFromThreadTasks<InterruptType = unknown>(
+  allInterrupts: Interrupt<InterruptType>[]
+): Interrupt<InterruptType>[] | null {
+  if (allInterrupts.length === 0) return null;
+
+  const filtered = filterOutHeadlessToolInterrupts(allInterrupts);
+  if (filtered.length === 0) return [];
+
+  return normalizeInterruptsList(filtered as Interrupt<InterruptType>[]);
+}
+
+export function extractInterrupts<InterruptType = unknown>(
+  values: unknown,
+  options?: {
+    isLoading: boolean;
+    threadState: ThreadState | undefined;
+    error: unknown;
+  }
+): Interrupt<InterruptType> | undefined {
+  const valueInterrupts = valuesInterrupts<InterruptType>(values);
+  if (valueInterrupts != null) {
+    if (valueInterrupts.length === 0) return { when: "breakpoint" };
+
+    const filtered = filterOutHeadlessToolInterrupts(valueInterrupts);
+    if (filtered.length === 0) return undefined;
+    if (filtered.length === 1) {
+      return normalizeInterruptForClient(
+        filtered[0] as Interrupt<InterruptType>
+      );
+    }
+
+    // TODO: fix the typing of interrupts if multiple interrupts are returned
+    const normalized = filtered.map((i) => normalizeInterruptForClient(i));
+    return normalized as unknown as Interrupt<InterruptType> | undefined;
+  }
+
+  // If we're deferring to old interrupt detection logic, don't show the interrupt if the stream is loading
+  if (options?.isLoading) return undefined;
+
+  const interrupts = options?.threadState?.tasks?.at(-1)?.interrupts;
+  if (interrupts == null || interrupts.length === 0) {
+    // check if there's a next task present
+    const next = options?.threadState?.next ?? [];
+    if (!next.length || options?.error != null) return undefined;
+    return { when: "breakpoint" };
+  }
+
+  const filtered = filterOutHeadlessToolInterrupts(
+    interrupts as Interrupt<InterruptType>[]
+  );
+  if (filtered.length === 0) {
+    const next = options?.threadState?.next ?? [];
+    if (!next.length || options?.error != null) return undefined;
+    return { when: "breakpoint" };
+  }
+
+  // Return only the current interrupt
+  return normalizeInterruptForClient(
+    filtered.at(-1) as Interrupt<InterruptType>
+  );
+}

@@ -1,0 +1,987 @@
+import type { RunnableConfig } from "@langchain/core/runnables";
+import {
+  BaseCheckpointSaver,
+  type Checkpoint,
+  type CheckpointListOptions,
+  type CheckpointTuple,
+  type SerializerProtocol,
+  type PendingWrite,
+  type CheckpointMetadata,
+  type CheckpointPendingWrite,
+  type ChannelVersions,
+  type DeltaChannelHistory,
+  compareWritesSortKeys,
+  writesSortKey,
+  WRITES_IDX_MAP,
+  TASKS,
+  maxChannelVersion,
+} from "@langchain/langgraph-checkpoint";
+import pg from "pg";
+import { parse as parseArray } from "postgres-array";
+
+import { getMigrations } from "./migrations.js";
+import {
+  type DeltaStage1Row,
+  type DeltaStage2Row,
+  type SQL_STATEMENTS,
+  type SQL_TYPES,
+  MAX_BATCH_ROWS,
+  getDeltaStage1SQL,
+  getDeltaStage2SQL,
+  getSQLStatements,
+  getTablesWithSchema,
+} from "./sql.js";
+
+/** @inline */
+interface PostgresSaverOptions {
+  schema: string;
+}
+
+const BYTEA_ARRAY_OID = 1001;
+const parseBytea = pg.types.getTypeParser(pg.types.builtins.BYTEA, "text");
+
+/**
+ * Type parsers for the checkpoint reads, which return blobs as `bytea[]`.
+ * pg@8 pins `pg-types@2.2.0`, whose `postgres-array@2` parser collects each
+ * element one character at a time: a blob over ~61 MB exceeds V8's array
+ * length limit and aborts the process. postgres-array@3 slices the source
+ * instead. Other types fall through to `pg.types`.
+ */
+const READ_TYPES = {
+  getTypeParser: (oid: number, format?: "text" | "binary") =>
+    oid === BYTEA_ARRAY_OID && format !== "binary"
+      ? (value: string) => parseArray(value, parseBytea)
+      : pg.types.getTypeParser(oid, format),
+};
+
+const _defaultOptions: PostgresSaverOptions = {
+  schema: "public",
+};
+
+const _ensureCompleteOptions = (
+  options?: Partial<PostgresSaverOptions>
+): PostgresSaverOptions => {
+  return {
+    ...options,
+    schema: options?.schema ?? _defaultOptions.schema,
+  };
+};
+
+const { Pool } = pg;
+
+/** Checkpoints per stage-1 page, as Python's `_DELTA_PAGE_SIZE`. */
+const DELTA_PAGE_SIZE = 1024;
+
+/** One channel's walk up the target's ancestors. */
+type DeltaWalk = {
+  channel: string;
+  /** Ancestors walked, the target's parent first. */
+  chain: string[];
+  /** The next ancestor: unset until the target is read, null once ended. */
+  cursor?: string | null;
+  /** The version whose stored blob ended the walk. */
+  seedVersion?: string;
+};
+
+/**
+ * Python's `_try_advance_walks` for one channel: walks as far as the stage-1
+ * rows read so far allow, up to a stored value, a root, or an ancestor on a
+ * page not read yet.
+ */
+function tryAdvanceWalk(
+  walk: DeltaWalk,
+  i: number,
+  targetId: string,
+  rows: Map<string, DeltaStage1Row>
+): void {
+  if (walk.cursor === undefined) {
+    const target = rows.get(targetId);
+    if (target === undefined) return;
+    walk.cursor = target.parent_checkpoint_id;
+  }
+  while (walk.cursor != null) {
+    const row = rows.get(walk.cursor);
+    if (row === undefined) return;
+    // More steps than rows read means a loop of parent links, on which the
+    // base walk never returns.
+    if (walk.chain.length === rows.size) {
+      throw new Error(`Checkpoint ${walk.cursor} is its own ancestor.`);
+    }
+    walk.chain.push(row.checkpoint_id);
+    if (row[`hb_${i}`]) {
+      walk.seedVersion = row[`ver_${i}`] as string;
+      walk.cursor = null;
+    } else {
+      walk.cursor = row.parent_checkpoint_id;
+    }
+  }
+}
+
+/**
+ * LangGraph checkpointer that uses a Postgres instance as the backing store.
+ * Uses the [node-postgres](https://node-postgres.com/) package internally
+ * to connect to a Postgres instance.
+ *
+ * @example
+ * ```
+ * import { ChatOpenAI } from "@langchain/openai";
+ * import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+ * import { createReactAgent } from "@langchain/langgraph/prebuilt";
+ *
+ * const checkpointer = PostgresSaver.fromConnString(
+ *   "postgresql://user:password@localhost:5432/db",
+ *   // optional configuration object
+ *   {
+ *     schema: "custom_schema" // defaults to "public"
+ *   }
+ * );
+ *
+ * // NOTE: you need to call .setup() the first time you're using your checkpointer
+ * await checkpointer.setup();
+ *
+ * const graph = createReactAgent({
+ *   tools: [getWeather],
+ *   llm: new ChatOpenAI({
+ *     model: "gpt-4o-mini",
+ *   }),
+ *   checkpointSaver: checkpointer,
+ * });
+ * const config = { configurable: { thread_id: "1" } };
+ *
+ * await graph.invoke({
+ *   messages: [{
+ *     role: "user",
+ *     content: "what's the weather in sf"
+ *   }],
+ * }, config);
+ * ```
+ */
+export class PostgresSaver extends BaseCheckpointSaver {
+  private readonly pool: pg.Pool;
+
+  private readonly options: PostgresSaverOptions;
+
+  private readonly SQL_STATEMENTS: SQL_STATEMENTS;
+
+  protected isSetup: boolean;
+
+  constructor(
+    pool: pg.Pool,
+    serde?: SerializerProtocol,
+    options?: Partial<PostgresSaverOptions>
+  ) {
+    super(serde);
+    this.pool = pool;
+    this.isSetup = false;
+    this.options = _ensureCompleteOptions(options);
+    this.SQL_STATEMENTS = getSQLStatements(this.options.schema);
+  }
+
+  /**
+   * Creates a new instance of PostgresSaver from a connection string.
+   *
+   * @param {string} connString - The connection string to connect to the Postgres database.
+   * @param {PostgresSaverOptions} [options] - Optional configuration object.
+   * @returns {PostgresSaver} A new instance of PostgresSaver.
+   *
+   * @example
+   * const connString = "postgresql://user:password@localhost:5432/db";
+   * const checkpointer = PostgresSaver.fromConnString(connString, {
+   *  schema: "custom_schema" // defaults to "public"
+   * });
+   * await checkpointer.setup();
+   */
+  static fromConnString(
+    connString: string,
+    options?: Partial<PostgresSaverOptions>
+  ): PostgresSaver {
+    const pool = new Pool({ connectionString: connString });
+    return new PostgresSaver(pool, undefined, options);
+  }
+
+  /**
+   * Set up the checkpoint database asynchronously.
+   *
+   * This method creates the necessary tables in the Postgres database if they don't
+   * already exist and runs database migrations. It MUST be called directly by the user
+   * the first time checkpointer is used.
+   */
+  async setup(): Promise<void> {
+    const client = await this.pool.connect();
+    const SCHEMA_TABLES = getTablesWithSchema(this.options.schema);
+    try {
+      await client.query(
+        `CREATE SCHEMA IF NOT EXISTS "${this.options.schema}"`
+      );
+      let version = -1;
+      const MIGRATIONS = getMigrations(this.options.schema);
+
+      try {
+        const result = await client.query(
+          `SELECT v FROM ${SCHEMA_TABLES.checkpoint_migrations} ORDER BY v DESC LIMIT 1`
+        );
+        if (result.rows.length > 0) {
+          version = result.rows[0].v;
+        }
+      } catch (error: unknown) {
+        // Assume table doesn't exist if there's an error
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          typeof error.code === "string" &&
+          error.code === "42P01" // Postgres error code for undefined_table
+        ) {
+          version = -1;
+        } else {
+          throw error;
+        }
+      }
+
+      for (let v = version + 1; v < MIGRATIONS.length; v += 1) {
+        await client.query(MIGRATIONS[v]);
+        await client.query(
+          `INSERT INTO ${SCHEMA_TABLES.checkpoint_migrations} (v) VALUES ($1)`,
+          [v]
+        );
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  protected async _loadCheckpoint(
+    checkpoint: Omit<Checkpoint, "pending_sends" | "channel_values">,
+    channelValues: [Uint8Array, Uint8Array, Uint8Array][]
+  ): Promise<Checkpoint> {
+    return {
+      ...checkpoint,
+      channel_versions: checkpoint.channel_versions ?? {},
+      versions_seen: checkpoint.versions_seen ?? {},
+      channel_values: await this._loadBlobs(channelValues),
+    };
+  }
+
+  protected async _loadBlobs(
+    blobValues: [Uint8Array, Uint8Array, Uint8Array][]
+  ): Promise<Record<string, unknown>> {
+    if (!blobValues || blobValues.length === 0) {
+      return {};
+    }
+    const textDecoder = new TextDecoder();
+    const entries = await Promise.all(
+      blobValues
+        .filter(([, t]) => textDecoder.decode(t) !== "empty")
+        .map(async ([k, t, v]) => [
+          textDecoder.decode(k),
+          await this.serde.loadsTyped(textDecoder.decode(t), v),
+        ])
+    );
+    return Object.fromEntries(entries);
+  }
+
+  protected async _loadMetadata(metadata: Record<string, unknown>) {
+    const [type, dumpedValue] = await this.serde.dumpsTyped(metadata);
+    return this.serde.loadsTyped(type, dumpedValue);
+  }
+
+  /**
+   * Deserialize pending-write rows into public pending writes, in
+   * `writesSortKey` order.
+   *
+   * Rows are `(task_id, channel, type, blob, task_path, idx)` — the SQL
+   * aggregate deliberately carries no `ORDER BY`, so the order never depends
+   * on a database collation; sorting happens here, through the shared
+   * comparator, matching live execution.
+   */
+  protected async _loadWrites(
+    writes:
+      | [
+          Uint8Array,
+          Uint8Array,
+          Uint8Array,
+          Uint8Array,
+          Uint8Array,
+          Uint8Array,
+        ][]
+      | null
+  ): Promise<[string, string, unknown][]> {
+    const decoder = new TextDecoder();
+    if (!writes) return [];
+    // Decode the ordering fields once per row, then sort on the cached keys.
+    const keyed = writes.map((row) => {
+      const [tid, , , , taskPath, idx] = row;
+      return {
+        key: writesSortKey(
+          decoder.decode(taskPath),
+          decoder.decode(tid),
+          Number(decoder.decode(idx))
+        ),
+        row,
+      };
+    });
+    keyed.sort((a, b) => compareWritesSortKeys(a.key, b.key));
+    return Promise.all(
+      keyed.map(async ({ row: [tid, channel, t, v] }) => [
+        decoder.decode(tid),
+        decoder.decode(channel),
+        await this.serde.loadsTyped(decoder.decode(t), v),
+      ])
+    );
+  }
+
+  protected async _dumpBlobs(
+    threadId: string,
+    checkpointNs: string,
+    values: Record<string, unknown>,
+    versions: ChannelVersions
+  ): Promise<
+    [string, string, string, string, string, Uint8Array | undefined][]
+  > {
+    if (Object.keys(versions).length === 0) {
+      return [];
+    }
+
+    return Promise.all(
+      Object.entries(versions).map(async ([k, ver]) => {
+        const [type, value] =
+          k in values
+            ? await this.serde.dumpsTyped(values[k])
+            : ["empty", null];
+        return [
+          threadId,
+          checkpointNs,
+          k,
+          ver.toString(),
+          type,
+          value ? new Uint8Array(value) : undefined,
+        ];
+      })
+    );
+  }
+
+  /**
+   * One past the integer part of `current`, plus a random fraction. Blobs are
+   * stored per channel and version, so two branches from one checkpoint that
+   * minted the same version would share a blob: the second branch's value is
+   * dropped and it reads back the first one's. A string version (from a
+   * Python saver) throws in the base class rather than turn into `NaN`.
+   */
+  getNextVersion(current: number | undefined): number {
+    return Math.floor(super.getNextVersion(current)) + Math.random();
+  }
+
+  protected _dumpCheckpoint(checkpoint: Checkpoint) {
+    const serialized: Record<string, unknown> = { ...checkpoint };
+    if ("channel_values" in serialized) delete serialized.channel_values;
+    return serialized;
+  }
+
+  protected async _dumpMetadata(metadata: CheckpointMetadata) {
+    const [, serializedMetadata] = await this.serde.dumpsTyped(metadata);
+    // We need to remove null characters before writing
+    return JSON.parse(
+      new TextDecoder().decode(serializedMetadata).replace(/\0/g, "")
+    );
+  }
+
+  protected async _dumpWrites(
+    threadId: string,
+    checkpointNs: string,
+    checkpointId: string,
+    taskId: string,
+    writes: [string, unknown][],
+    taskPath = ""
+  ): Promise<
+    [
+      string,
+      string,
+      string,
+      string,
+      string,
+      number,
+      string,
+      string,
+      Uint8Array,
+    ][]
+  > {
+    return Promise.all(
+      writes.map(async ([channel, value], idx) => {
+        const [type, serializedValue] = await this.serde.dumpsTyped(value);
+        return [
+          threadId,
+          checkpointNs,
+          checkpointId,
+          taskId,
+          taskPath,
+          WRITES_IDX_MAP[channel] ?? idx,
+          channel,
+          type,
+          new Uint8Array(serializedValue),
+        ];
+      })
+    );
+  }
+
+  /**
+   * Return WHERE clause predicates for a given list() config, filter, cursor.
+   *
+   * This method returns a tuple of a string and a tuple of values. The string
+   * is the parameterized WHERE clause predicate (including the WHERE keyword):
+   * "WHERE column1 = $1 AND column2 IS $2". The list of values contains the
+   * values for each of the corresponding parameters.
+   */
+  protected _searchWhere(
+    config?: RunnableConfig,
+    filter?: Record<string, unknown>,
+    before?: RunnableConfig
+  ): [string, unknown[]] {
+    const wheres: string[] = [];
+    const paramValues: unknown[] = [];
+
+    // construct predicate for config filter
+    if (config?.configurable?.thread_id) {
+      wheres.push(`thread_id = $${paramValues.length + 1}`);
+      paramValues.push(config.configurable.thread_id);
+    }
+
+    // strict checks for undefined/null because empty strings are falsy
+    if (
+      config?.configurable?.checkpoint_ns !== undefined &&
+      config?.configurable?.checkpoint_ns !== null
+    ) {
+      wheres.push(`checkpoint_ns = $${paramValues.length + 1}`);
+      paramValues.push(config.configurable.checkpoint_ns);
+    }
+
+    if (config?.configurable?.checkpoint_id) {
+      wheres.push(`checkpoint_id = $${paramValues.length + 1}`);
+      paramValues.push(config.configurable.checkpoint_id);
+    }
+
+    // construct predicate for metadata filter
+    if (filter && Object.keys(filter).length > 0) {
+      wheres.push(`metadata @> $${paramValues.length + 1}`);
+      paramValues.push(JSON.stringify(filter));
+    }
+
+    // construct predicate for `before`
+    if (before?.configurable?.checkpoint_id !== undefined) {
+      wheres.push(`checkpoint_id < $${paramValues.length + 1}`);
+      paramValues.push(before.configurable.checkpoint_id);
+    }
+
+    return [
+      wheres.length > 0 ? `WHERE ${wheres.join(" AND ")}` : "",
+      paramValues,
+    ];
+  }
+
+  /**
+   * Get a checkpoint tuple from the database.
+   * This method retrieves a checkpoint tuple from the Postgres database
+   * based on the provided config. If the config's configurable field contains
+   * a "checkpoint_id" key, the checkpoint with the matching thread_id and
+   * namespace is retrieved. Otherwise, the latest checkpoint for the given
+   * thread_id is retrieved.
+   * @param config The config to use for retrieving the checkpoint.
+   * @returns The retrieved checkpoint tuple, or undefined.
+   */
+  async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
+    const {
+      thread_id,
+      checkpoint_ns = "",
+      checkpoint_id,
+    } = config.configurable ?? {};
+
+    let args: unknown[];
+    let where: string;
+    if (checkpoint_id) {
+      where =
+        "WHERE thread_id = $1 AND checkpoint_ns = $2 AND checkpoint_id = $3";
+      args = [thread_id, checkpoint_ns, checkpoint_id];
+    } else {
+      where =
+        "WHERE thread_id = $1 AND checkpoint_ns = $2 ORDER BY checkpoint_id DESC LIMIT 1";
+      args = [thread_id, checkpoint_ns];
+    }
+
+    const result = await this.pool.query<SQL_TYPES["SELECT_SQL"]>({
+      text: this.SQL_STATEMENTS.SELECT_SQL + where,
+      values: args,
+      types: READ_TYPES,
+    });
+
+    const [row] = result.rows;
+    if (row === undefined) return undefined;
+
+    if (row.checkpoint.v < 4 && row.parent_checkpoint_id != null) {
+      const sendsResult = await this.pool.query<
+        SQL_TYPES["SELECT_PENDING_SENDS_SQL"]
+      >({
+        text: this.SQL_STATEMENTS.SELECT_PENDING_SENDS_SQL,
+        values: [thread_id, [row.parent_checkpoint_id]],
+        types: READ_TYPES,
+      });
+
+      const [sendsRow] = sendsResult.rows;
+      if (sendsRow != null) {
+        await this._migratePendingSends(sendsRow.pending_sends, row);
+      }
+    }
+
+    const checkpoint = await this._loadCheckpoint(
+      row.checkpoint,
+      row.channel_values
+    );
+
+    const finalConfig = {
+      configurable: {
+        thread_id,
+        checkpoint_ns,
+        checkpoint_id: row.checkpoint_id,
+      },
+    };
+    const metadata = await this._loadMetadata(row.metadata);
+    const parentConfig = row.parent_checkpoint_id
+      ? {
+          configurable: {
+            thread_id,
+            checkpoint_ns,
+            checkpoint_id: row.parent_checkpoint_id,
+          },
+        }
+      : undefined;
+    const pendingWrites = await this._loadWrites(row.pending_writes);
+
+    return {
+      config: finalConfig,
+      checkpoint,
+      metadata,
+      parentConfig,
+      pendingWrites,
+    };
+  }
+
+  /**
+   * List checkpoints from the database.
+   *
+   * This method retrieves a list of checkpoint tuples from the Postgres database based
+   * on the provided config. The checkpoints are ordered by checkpoint ID in descending order (newest first).
+   */
+  async *list(
+    config: RunnableConfig,
+    options?: CheckpointListOptions
+  ): AsyncGenerator<CheckpointTuple> {
+    const { filter, before, limit } = options ?? {};
+    const [where, args] = this._searchWhere(config, filter, before);
+    let query = `${this.SQL_STATEMENTS.SELECT_SQL}${where} ORDER BY checkpoint_id DESC`;
+    if (limit !== undefined) {
+      query += ` LIMIT ${Number.parseInt(limit.toString(), 10)}`; // sanitize via parseInt, as limit could be an externally provided value
+    }
+
+    const result = await this.pool.query<SQL_TYPES["SELECT_SQL"]>({
+      text: query,
+      values: args,
+      types: READ_TYPES,
+    });
+    const toMigrate = result.rows.filter(
+      (row) => row.checkpoint.v < 4 && row.parent_checkpoint_id != null
+    );
+
+    if (toMigrate.length > 0) {
+      const sendsResult = await this.pool.query<
+        SQL_TYPES["SELECT_PENDING_SENDS_SQL"]
+      >({
+        text: this.SQL_STATEMENTS.SELECT_PENDING_SENDS_SQL,
+        values: [
+          toMigrate[0].thread_id,
+          toMigrate.map((row) => row.parent_checkpoint_id),
+        ],
+        types: READ_TYPES,
+      });
+
+      const parentMap = toMigrate.reduce<
+        Record<string, SQL_TYPES["SELECT_SQL"][]>
+      >((acc, row) => {
+        if (!row.parent_checkpoint_id) return acc;
+
+        acc[row.parent_checkpoint_id] ??= [];
+        acc[row.parent_checkpoint_id].push(row);
+        return acc;
+      }, {});
+
+      // add to values
+      for (const sendsRow of sendsResult.rows) {
+        for (const row of parentMap[sendsRow.checkpoint_id]) {
+          await this._migratePendingSends(sendsRow.pending_sends, row);
+        }
+      }
+    }
+
+    for (const value of result.rows) {
+      yield {
+        config: {
+          configurable: {
+            thread_id: value.thread_id,
+            checkpoint_ns: value.checkpoint_ns,
+            checkpoint_id: value.checkpoint_id,
+          },
+        },
+        checkpoint: await this._loadCheckpoint(
+          value.checkpoint,
+          value.channel_values
+        ),
+        metadata: await this._loadMetadata(value.metadata),
+        parentConfig: value.parent_checkpoint_id
+          ? {
+              configurable: {
+                thread_id: value.thread_id,
+                checkpoint_ns: value.checkpoint_ns,
+                checkpoint_id: value.parent_checkpoint_id,
+              },
+            }
+          : undefined,
+        pendingWrites: await this._loadWrites(value.pending_writes),
+      };
+    }
+  }
+
+  /** @internal */
+  async _migratePendingSends(
+    pendingSends: [Uint8Array, Uint8Array][],
+    mutableRow: {
+      channel_values: [Uint8Array, Uint8Array, Uint8Array][];
+      checkpoint: Omit<Checkpoint, "pending_sends" | "channel_values">;
+    }
+  ) {
+    const textEncoder = new TextEncoder();
+    const textDecoder = new TextDecoder();
+    const row = mutableRow;
+
+    const [enc, blob] = await this.serde.dumpsTyped(
+      await Promise.all(
+        pendingSends.map(([enc, blob]) =>
+          this.serde.loadsTyped(textDecoder.decode(enc), blob)
+        )
+      )
+    );
+
+    row.channel_values ??= [];
+    row.channel_values.push([
+      textEncoder.encode(TASKS),
+      textEncoder.encode(enc),
+      blob,
+    ]);
+
+    // add to versions
+    row.checkpoint.channel_versions[TASKS] =
+      Object.keys(mutableRow.checkpoint.channel_versions).length > 0
+        ? maxChannelVersion(
+            ...Object.values(mutableRow.checkpoint.channel_versions)
+          )
+        : this.getNextVersion(undefined);
+  }
+
+  /**
+   * Save a checkpoint to the database.
+   *
+   * This method saves a checkpoint to the Postgres database. The checkpoint is associated
+   * with the provided config and its parent config (if any).
+   * @param config
+   * @param checkpoint
+   * @param metadata
+   * @returns
+   */
+  async put(
+    config: RunnableConfig,
+    checkpoint: Checkpoint,
+    metadata: CheckpointMetadata,
+    newVersions: ChannelVersions
+  ): Promise<RunnableConfig> {
+    if (config.configurable === undefined) {
+      throw new Error(`Missing "configurable" field in "config" param`);
+    }
+    const {
+      thread_id,
+      checkpoint_ns = "",
+      checkpoint_id,
+    } = config.configurable;
+
+    const nextConfig = {
+      configurable: {
+        thread_id,
+        checkpoint_ns,
+        checkpoint_id: checkpoint.id,
+      },
+    };
+
+    // Serialize before acquiring a connection so the transaction only contains
+    // INSERT statements.  Serializing inside BEGIN/COMMIT holds the connection
+    // idle while CPU-bound serde runs; under event-loop contention this can
+    // stretch transactions to minutes and starve the connection pool.
+    const serializedCheckpoint = this._dumpCheckpoint(checkpoint);
+    const [serializedBlobs, serializedMetadata] = await Promise.all([
+      this._dumpBlobs(
+        thread_id,
+        checkpoint_ns,
+        checkpoint.channel_values,
+        newVersions
+      ),
+      this._dumpMetadata(metadata),
+    ]);
+
+    const checkpointRow = [
+      thread_id,
+      checkpoint_ns,
+      checkpoint.id,
+      checkpoint_id,
+      serializedCheckpoint,
+      serializedMetadata,
+    ];
+    if (serializedBlobs.length <= MAX_BATCH_ROWS) {
+      await this.pool.query(
+        serializedBlobs.length > 0
+          ? this.SQL_STATEMENTS.UPSERT_CHECKPOINT_WITH_BLOBS_SQL(
+              serializedBlobs.length
+            )
+          : this.SQL_STATEMENTS.UPSERT_CHECKPOINTS_SQL,
+        [...checkpointRow, ...serializedBlobs.flatMap((b) => b.slice(2))]
+      );
+      return nextConfig;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const serializedBlob of serializedBlobs) {
+        await client.query(
+          this.SQL_STATEMENTS.UPSERT_CHECKPOINT_BLOBS_SQL,
+          serializedBlob
+        );
+      }
+      await client.query(
+        this.SQL_STATEMENTS.UPSERT_CHECKPOINTS_SQL,
+        checkpointRow
+      );
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+    return nextConfig;
+  }
+
+  /**
+   * Store intermediate writes linked to a checkpoint.
+   *
+   * This method saves intermediate writes associated with a checkpoint to the Postgres database.
+   * @param config Configuration of the related checkpoint.
+   * @param writes List of writes to store.
+   * @param taskId Identifier for the task creating the writes.
+   */
+  async putWrites(
+    config: RunnableConfig,
+    writes: PendingWrite[],
+    taskId: string,
+    taskPath?: string
+  ): Promise<void> {
+    const query = writes.every((w) => w[0] in WRITES_IDX_MAP)
+      ? this.SQL_STATEMENTS.UPSERT_CHECKPOINT_WRITES_SQL
+      : this.SQL_STATEMENTS.INSERT_CHECKPOINT_WRITES_SQL;
+
+    const dumpedWrites = await this._dumpWrites(
+      config.configurable?.thread_id,
+      config.configurable?.checkpoint_ns,
+      config.configurable?.checkpoint_id,
+      taskId,
+      writes,
+      taskPath ?? ""
+    );
+    if (
+      query === this.SQL_STATEMENTS.INSERT_CHECKPOINT_WRITES_SQL &&
+      dumpedWrites.length <= MAX_BATCH_ROWS
+    ) {
+      // One statement is atomic alone, so this skips BEGIN and COMMIT and a
+      // round trip per row.
+      await this.pool.query(
+        this.SQL_STATEMENTS.INSERT_CHECKPOINT_WRITES_BATCH_SQL(
+          dumpedWrites.length
+        ),
+        [
+          ...dumpedWrites[0].slice(0, 5),
+          ...dumpedWrites.flatMap((w) => w.slice(5)),
+        ]
+      );
+      return;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for await (const dumpedWrite of dumpedWrites) {
+        await client.query(query, dumpedWrite);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async end() {
+    return this.pool.end();
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(this.SQL_STATEMENTS.DELETE_CHECKPOINT_BLOBS_SQL, [
+        threadId,
+      ]);
+      await client.query(this.SQL_STATEMENTS.DELETE_CHECKPOINTS_SQL, [
+        threadId,
+      ]);
+      await client.query(this.SQL_STATEMENTS.DELETE_CHECKPOINT_WRITES_SQL, [
+        threadId,
+      ]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Port of langgraph (Python)'s `PostgresSaver.get_delta_channel_history`:
+   * the base walk's result without a `getTuple` per ancestor.
+   *
+   * Stage 1 pages through the thread's checkpoints newest first, starting at
+   * the target, reading each one's parent and, per channel, its version and
+   * whether a blob is stored at it, and walks each channel's ancestors over
+   * the rows read up to its first stored value. Paging stops once every
+   * channel has one or a page comes back short. Stage 2 reads the walked
+   * writes and the stored values' blobs in one query. A walk left on an
+   * ancestor no page held, a parent never stored or one whose id sorts above
+   * the target's, falls back to the base walk. Unlike Python, only
+   * blobs count as stored values, as `put` stores every value as one, and
+   * writes follow `writesSortKey`, as the base walk's do.
+   *
+   * @remarks Beta. See {@link BaseCheckpointSaver.getDeltaChannelHistory}.
+   */
+  async getDeltaChannelHistory(options: {
+    config: RunnableConfig;
+    channels: string[];
+  }): Promise<Record<string, DeltaChannelHistory>> {
+    const channels = Array.from(new Set(options.channels));
+    if (channels.length === 0) return {};
+    const { thread_id, checkpoint_ns = "" } = options.config.configurable ?? {};
+    let targetId: string = options.config.configurable?.checkpoint_id;
+    if (!targetId) {
+      const target = await this.getTuple(options.config);
+      if (target === undefined) {
+        return Object.fromEntries(channels.map((ch) => [ch, { writes: [] }]));
+      }
+      targetId = target.config.configurable?.checkpoint_id;
+    }
+
+    let stage1SQL = getDeltaStage1SQL(
+      this.options.schema,
+      channels.length,
+      true
+    );
+    const rows = new Map<string, DeltaStage1Row>();
+    const walks: DeltaWalk[] = channels.map((channel) => ({
+      channel,
+      chain: [],
+    }));
+    let cursor = targetId;
+    for (;;) {
+      const { rows: page }: { rows: DeltaStage1Row[] } = await this.pool.query(
+        stage1SQL,
+        [...channels, thread_id, checkpoint_ns, cursor, DELTA_PAGE_SIZE]
+      );
+      // The first page opens with the target if it is stored.
+      if (
+        page.length === 0 ||
+        (cursor === targetId && page[0].checkpoint_id !== targetId)
+      ) {
+        break;
+      }
+      for (const row of page) rows.set(row.checkpoint_id, row);
+      walks.forEach((walk, i) => tryAdvanceWalk(walk, i, targetId, rows));
+      if (
+        walks.every((walk) => walk.seedVersion !== undefined) ||
+        page.length < DELTA_PAGE_SIZE
+      ) {
+        break;
+      }
+      cursor = page[page.length - 1].checkpoint_id;
+      stage1SQL = getDeltaStage1SQL(this.options.schema, channels.length);
+    }
+    // JS's uuid6 does not clamp to the last id as Python's does, so a parent
+    // can sort above the target, where no page reads.
+    if (walks.some((walk) => walk.cursor != null)) {
+      return super.getDeltaChannelHistory(options);
+    }
+
+    const chained = walks.filter((walk) => walk.chain.length > 0);
+    const seeded = walks.filter((walk) => walk.seedVersion !== undefined);
+    const { rows: stage2Rows } =
+      chained.length > 0
+        ? await this.pool.query<DeltaStage2Row>(
+            getDeltaStage2SQL(
+              this.options.schema,
+              chained.length,
+              seeded.length
+            ),
+            [
+              thread_id,
+              checkpoint_ns,
+              ...chained.flatMap((walk) => [walk.channel, walk.chain]),
+              ...seeded.flatMap((walk) => [walk.channel, walk.seedVersion]),
+            ]
+          )
+        : { rows: [] };
+
+    const result: Record<string, DeltaChannelHistory> = {};
+    for (const { channel, chain } of walks) {
+      const writesOf = new Map(
+        chain.map((id) => [id, [] as Extract<DeltaStage2Row, { _kind: "w" }>[]])
+      );
+      let seed: DeltaStage2Row | undefined;
+      for (const row of stage2Rows) {
+        if (row.channel !== channel) continue;
+        if (row._kind === "w") writesOf.get(row.checkpoint_id)?.push(row);
+        else seed = row;
+      }
+      const writes: CheckpointPendingWrite[] = [];
+      for (const id of chain.slice().reverse()) {
+        const rowsOfId = (writesOf.get(id) ?? []).sort((a, b) =>
+          compareWritesSortKeys(
+            writesSortKey(a.task_path, a.task_id, a.idx),
+            writesSortKey(b.task_path, b.task_id, b.idx)
+          )
+        );
+        for (const row of rowsOfId) {
+          writes.push([
+            row.task_id,
+            channel,
+            await this.serde.loadsTyped(row.type, row.blob),
+          ]);
+        }
+      }
+      const entry: DeltaChannelHistory = { writes };
+      if (seed !== undefined && seed.type !== "empty") {
+        entry.seed = await this.serde.loadsTyped(seed.type, seed.blob);
+      }
+      result[channel] = entry;
+    }
+    return result;
+  }
+}

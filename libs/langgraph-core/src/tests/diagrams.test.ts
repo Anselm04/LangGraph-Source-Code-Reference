@@ -1,0 +1,174 @@
+import { test, expect } from "vitest";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod/v4";
+import { createReactAgent, ToolNode } from "../prebuilt/index.js";
+import { FakeSearchTool } from "./utils.js";
+import { FakeToolCallingChatModel } from "./utils.models.js";
+import {
+  Annotation,
+  Command,
+  END,
+  MessagesAnnotation,
+  NodeError,
+  START,
+  StateGraph,
+  StateSchema,
+} from "../web.js";
+
+test("prebuilt agent", async () => {
+  // Define the tools for the agent to use
+  const tools = [
+    new FakeSearchTool(),
+    tool(() => "sunny", {
+      name: "get_weather",
+      description: "Get the weather",
+      schema: z.object({}),
+    }),
+  ];
+
+  const model = new FakeToolCallingChatModel({});
+
+  const app = createReactAgent({ llm: model, tools });
+
+  const graph = app.getGraph();
+  for (const drawable of [graph, await app.getGraphAsync()]) {
+    expect(drawable.nodes.tools.metadata).toEqual({
+      __tools: ["search_api", "get_weather"],
+    });
+    expect(drawable.nodes.agent.metadata).toEqual({});
+  }
+  const mermaid = graph.drawMermaid();
+  expect(mermaid).toEqual(`%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+\t__start__([<p>__start__</p>]):::first
+\ttools(tools<hr/><small><em>__tools = search_api,get_weather</em></small>)
+\tagent(agent)
+\t__end__([<p>__end__</p>]):::last
+\t__start__ --> agent;
+\ttools --> agent;
+\tagent -.-> tools;
+\tagent -.-> __end__;
+\tclassDef default fill:#f2f0ff,line-height:1.2;
+\tclassDef first fill-opacity:0;
+\tclassDef last fill:#bfb6fc;
+`);
+});
+
+test("drawing leaves node metadata unchanged", async () => {
+  const app = new StateGraph(MessagesAnnotation)
+    .addNode("tools", new ToolNode([new FakeSearchTool()]), {
+      metadata: { owner: "search" },
+    })
+    .addEdge(START, "tools")
+    .compile({ interruptBefore: ["tools"] });
+
+  for (const drawable of [app.getGraph(), await app.getGraphAsync()]) {
+    expect(drawable.nodes.tools.metadata).toEqual({
+      owner: "search",
+      __interrupt: "before",
+      __tools: ["search_api"],
+    });
+  }
+  expect(app.nodes.tools.metadata).toEqual({ owner: "search" });
+});
+
+test("implicit end edge for terminal nodes", async () => {
+  const State = new StateSchema({ status: z.string() });
+
+  const graph = new StateGraph(State)
+    .addNode(
+      "riskyNode",
+      (state: typeof State.State) => {
+        if (state.status === "fail") {
+          throw new Error("fail");
+        }
+        return { status: "ok" };
+      },
+      {
+        errorHandler: (_state: typeof State.State, _error: NodeError) =>
+          new Command({ update: { status: "recovered" }, goto: "recover" }),
+      }
+    )
+    .addNode("recover", (state: typeof State.State) => ({
+      status: `${state.status}_final`,
+    }))
+    .addEdge(START, "riskyNode")
+    .addEdge("recover", END)
+    .compile();
+
+  const mermaid = graph.getGraph().drawMermaid();
+  expect(mermaid).toContain("__start__ --> riskyNode;");
+  expect(mermaid).toContain("riskyNode --> __end__;");
+  expect(mermaid).toContain("recover --> __end__;");
+  expect(mermaid).not.toContain("__error_handler__riskyNode --> __end__;");
+});
+
+test("graph with multiple sinks", async () => {
+  const StateAnnotation = Annotation.Root({});
+  const app = new StateGraph(StateAnnotation)
+    .addNode("inner1", async () => {})
+    .addNode("inner2", async () => {})
+    .addNode("inner3", async () => {})
+    .addEdge("__start__", "inner1")
+    .addConditionalEdges("inner1", async () => "inner2", ["inner2", "inner3"])
+    .compile();
+
+  const graph = app.getGraph();
+  const mermaid = graph.drawMermaid();
+  expect(mermaid).toEqual(`%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+\t__start__([<p>__start__</p>]):::first
+\tinner1(inner1)
+\tinner2(inner2)
+\tinner3(inner3)
+\t__start__ --> inner1;
+\tinner1 -.-> inner2;
+\tinner1 -.-> inner3;
+\tclassDef default fill:#f2f0ff,line-height:1.2;
+\tclassDef first fill-opacity:0;
+\tclassDef last fill:#bfb6fc;
+`);
+});
+
+test("graph with subgraphs", async () => {
+  const SubgraphStateAnnotation = Annotation.Root({});
+  const subgraph = new StateGraph(SubgraphStateAnnotation)
+    .addNode("inner1", async () => {})
+    .addNode("inner2", async () => {})
+    .addNode("inner3", async () => {})
+    .addEdge("__start__", "inner1")
+    .addConditionalEdges("inner1", async () => "inner2", ["inner2", "inner3"])
+    .compile();
+
+  const StateAnnotation = Annotation.Root({});
+
+  const app = new StateGraph(StateAnnotation)
+    .addNode("starter", async () => {})
+    .addNode("inner", subgraph)
+    .addNode("final", async () => {})
+    .addEdge("__start__", "starter")
+    .addConditionalEdges("starter", async () => "final", ["inner", "final"])
+    .compile({ interruptBefore: ["starter"] });
+
+  const graph = app.getGraph({ xray: true });
+  const mermaid = graph.drawMermaid();
+  expect(mermaid).toEqual(`%%{init: {'flowchart': {'curve': 'linear'}}}%%
+graph TD;
+\t__start__([<p>__start__</p>]):::first
+\tstarter(starter<hr/><small><em>__interrupt = before</em></small>)
+\tinner_inner1(inner1)
+\tinner_inner2(inner2)
+\tinner_inner3(inner3)
+\tfinal(final)
+\t__start__ --> starter;
+\tstarter -.-> inner_inner1;
+\tstarter -.-> final;
+\tsubgraph inner
+\tinner_inner1 -.-> inner_inner2;
+\tinner_inner1 -.-> inner_inner3;
+\tend
+\tclassDef default fill:#f2f0ff,line-height:1.2;
+\tclassDef first fill-opacity:0;
+\tclassDef last fill:#bfb6fc;
+`);
+});

@@ -1,0 +1,475 @@
+import { describe, it, expect } from "vitest";
+import { HumanMessage } from "@langchain/core/messages";
+import type { RunnableConfig } from "@langchain/core/runnables";
+import {
+  type Checkpoint,
+  type CheckpointTuple,
+  BaseCheckpointSaver,
+  compareChannelVersions,
+  copyCheckpoint,
+  deepCopy,
+  emptyCheckpoint,
+  maxChannelVersion,
+} from "../base.js";
+import { MemorySaver } from "../memory.js";
+import { uuid6 } from "../id.js";
+import { TASKS } from "../index.js";
+import type { CheckpointMetadata } from "../types.js";
+
+const checkpoint1: Checkpoint = {
+  v: 4,
+  id: uuid6(0),
+  ts: "2024-04-19T17:19:07.952Z",
+  channel_values: {
+    someKey1: "someValue1",
+  },
+  channel_versions: {
+    someKey2: 1,
+  },
+  versions_seen: {
+    someKey3: {
+      someKey4: 1,
+    },
+  },
+};
+const checkpoint2: Checkpoint = {
+  v: 4,
+  id: uuid6(1),
+  ts: "2024-04-20T17:19:07.952Z",
+  channel_values: {
+    someKey1: "someValue2",
+  },
+  channel_versions: {
+    someKey2: 2,
+  },
+  versions_seen: {
+    someKey3: {
+      someKey4: 2,
+    },
+  },
+};
+
+describe("Base", () => {
+  it("should deep copy a simple object", () => {
+    const obj = { a: 1, b: { c: 2 } };
+    const copiedObj = deepCopy(obj);
+
+    // Check if the copied object is equal to the original object
+    expect(copiedObj).toEqual(obj);
+
+    // Check if the copied object is not the same object reference as the original object
+    expect(copiedObj).not.toBe(obj);
+
+    // Check if the nested object is also deep copied
+    expect(copiedObj.b).toEqual(obj.b);
+    expect(copiedObj.b).not.toBe(obj.b);
+  });
+
+  it("should deep copy an array", () => {
+    const arr = [1, 2, 3];
+    const copiedArr = deepCopy(arr);
+
+    // Check if the copied array is equal to the original array
+    expect(copiedArr).toEqual(arr);
+  });
+
+  it("should deep copy an array of objects", () => {
+    const arr = [{ a: 1 }, { b: 2 }];
+    const copiedArr = deepCopy(arr);
+
+    // Check if the copied array is equal to the original array
+    expect(copiedArr).toEqual(arr);
+
+    // Check if the copied array is not the same array reference as the original array
+    expect(copiedArr).not.toBe(arr);
+
+    // Check if the nested objects in the array are also deep copied
+    expect(copiedArr[0]).toEqual(arr[0]);
+    expect(copiedArr[0]).not.toBe(arr[0]);
+  });
+
+  it("copyCheckpoint defaults missing channel maps to empty objects", () => {
+    const partial = {
+      v: 4,
+      id: uuid6(0),
+      ts: "2024-04-19T17:19:07.952Z",
+    } as Checkpoint;
+
+    expect(copyCheckpoint(partial)).toEqual({
+      v: 4,
+      id: partial.id,
+      ts: partial.ts,
+      channel_values: {},
+      channel_versions: {},
+      versions_seen: {},
+    });
+  });
+
+  it("BaseCheckpointSaver.toJSON avoids backend client traversal", () => {
+    class TestSaver extends BaseCheckpointSaver {
+      backend = { timers: setTimeout(() => {}, 10_000) };
+
+      async getTuple() {
+        return undefined;
+      }
+
+      async *list() {}
+
+      async put(config: RunnableConfig) {
+        return config;
+      }
+
+      async putWrites() {}
+
+      async deleteThread() {}
+    }
+
+    const saver = new TestSaver();
+    expect(JSON.stringify({ configurable: { checkpointer: saver } })).toBe(
+      '{"configurable":{"checkpointer":"[TestSaver]"}}'
+    );
+    clearTimeout(saver.backend.timers);
+  });
+});
+
+describe("MemorySaver", () => {
+  describe.each([
+    { name: "custom IDs", ids: ["A", "Z", "a"] },
+    { name: "UUID6 IDs", ids: [uuid6(0), uuid6(0), uuid6(0)] },
+  ])("checkpoint ordering with $name", ({ ids }) => {
+    it.each(["", "child:task"])(
+      "uses descending code-unit order in namespace %j",
+      async (checkpoint_ns) => {
+        const saver = new MemorySaver();
+        const config = { configurable: { thread_id: "ordering", checkpoint_ns } };
+        for (const index of [1, 2, 0]) {
+          const savedConfig = await saver.put(
+            {
+              configurable: {
+                ...config.configurable,
+                checkpoint_id: ids[index - 1],
+              },
+            },
+            {
+              ...emptyCheckpoint(),
+              id: ids[index],
+              channel_values: { messages: ids[index] },
+            },
+            { source: "update", step: index, parents: {} }
+          );
+          await saver.putWrites(savedConfig, [["messages", ids[index]]], "task");
+        }
+
+        expect.soft((await saver.getTuple(config))?.checkpoint.id).toBe(ids[2]);
+        expect
+          .soft(
+            (await saver.getTuple({
+              configurable: { ...config.configurable, checkpoint_id: ids[1] },
+            }))?.checkpoint.id
+          )
+          .toBe(ids[1]);
+
+        const tuples: CheckpointTuple[] = [];
+        for await (const tuple of saver.list(config)) tuples.push(tuple);
+        expect.soft(tuples.map((tuple) => tuple.checkpoint.id)).toEqual([
+          ids[2],
+          ids[1],
+          ids[0],
+        ]);
+
+        const before: CheckpointTuple[] = [];
+        for await (const tuple of saver.list(config, {
+          before: {
+            configurable: { ...config.configurable, checkpoint_id: ids[1] },
+          },
+        })) {
+          before.push(tuple);
+        }
+        expect.soft(before.map((tuple) => tuple.checkpoint.id)).toEqual([ids[0]]);
+
+        const history = await saver.getDeltaChannelHistory({
+          config,
+          channels: ["messages"],
+        });
+        expect.soft(history.messages).toEqual({
+          seed: ids[1],
+          writes: [["task", "messages", ids[1]]],
+        });
+      }
+    );
+  });
+
+  it("should save and retrieve checkpoints correctly", async () => {
+    const memorySaver = new MemorySaver();
+
+    // save checkpoint
+    const runnableConfig = await memorySaver.put(
+      { configurable: { thread_id: "1", checkpoint_ns: "" } },
+      checkpoint1,
+      { source: "update", step: -1, parents: {} }
+    );
+    expect(runnableConfig).toEqual({
+      configurable: {
+        thread_id: "1",
+        checkpoint_ns: "",
+        checkpoint_id: checkpoint1.id,
+      },
+    });
+
+    // get checkpoint tuple
+    const checkpointTuple = await memorySaver.getTuple({
+      configurable: { thread_id: "1", checkpoint_ns: "" },
+    });
+    expect(checkpointTuple?.config).toEqual({
+      configurable: {
+        thread_id: "1",
+        checkpoint_ns: "",
+        checkpoint_id: checkpoint1.id,
+      },
+    });
+    expect(checkpointTuple?.checkpoint).toEqual(checkpoint1);
+
+    // save another checkpoint
+    await memorySaver.put(
+      { configurable: { thread_id: "1", checkpoint_ns: "" } },
+      checkpoint2,
+      {
+        source: "update",
+        step: -1,
+        parents: {},
+      }
+    );
+
+    // list checkpoints
+    const checkpointTupleGenerator = await memorySaver.list({
+      configurable: { thread_id: "1", checkpoint_ns: "" },
+    });
+    const checkpointTuples: CheckpointTuple[] = [];
+    for await (const checkpoint of checkpointTupleGenerator) {
+      checkpointTuples.push(checkpoint);
+    }
+    expect(checkpointTuples.length).toBe(2);
+
+    const checkpointTuple1 = checkpointTuples[0];
+    const checkpointTuple2 = checkpointTuples[1];
+    expect(checkpointTuple1.checkpoint.ts).toBe("2024-04-20T17:19:07.952Z");
+    expect(checkpointTuple2.checkpoint.ts).toBe("2024-04-19T17:19:07.952Z");
+  });
+
+  it("should migrate pending sends", async () => {
+    const memorySaver = new MemorySaver();
+    let config: RunnableConfig = {
+      configurable: { thread_id: "thread-1", checkpoint_ns: "" },
+    };
+
+    const checkpoint0: Checkpoint = {
+      v: 1,
+      id: uuid6(0),
+      ts: "2024-04-19T17:19:07.952Z",
+      channel_values: {},
+      channel_versions: {},
+      versions_seen: {},
+    };
+
+    config = await memorySaver.put(config, checkpoint0, {
+      source: "loop",
+      parents: {},
+      step: 0,
+    });
+
+    await memorySaver.putWrites(
+      config,
+      [
+        [TASKS, "send-1"],
+        [TASKS, "send-2"],
+      ],
+      "task-1"
+    );
+    await memorySaver.putWrites(config, [[TASKS, "send-3"]], "task-2");
+
+    // check that fetching checkpount 0 doesn't attach pending sends
+    // (they should be attached to the next checkpoint)
+    const tuple0 = await memorySaver.getTuple(config);
+    expect(tuple0?.checkpoint.channel_values).toEqual({});
+    expect(tuple0?.checkpoint.channel_versions).toEqual({});
+
+    // create second checkpoint
+    const checkpoint1: Checkpoint = {
+      v: 1,
+      id: uuid6(1),
+      ts: "2024-04-20T17:19:07.952Z",
+      channel_values: {},
+      channel_versions: checkpoint0.channel_versions,
+      versions_seen: checkpoint0.versions_seen,
+    };
+    config = await memorySaver.put(config, checkpoint1, {
+      source: "loop",
+      parents: {},
+      step: 1,
+    });
+
+    // check that pending sends are attached to checkpoint1
+    const checkpoint1Tuple = await memorySaver.getTuple(config);
+    expect.soft(checkpoint1Tuple?.checkpoint.channel_values).toEqual({
+      [TASKS]: ["send-1", "send-2", "send-3"],
+    });
+    expect(checkpoint1Tuple?.checkpoint.channel_versions[TASKS]).toBeDefined();
+
+    // check that the list also applies the migration
+    const checkpointTupleGenerator = memorySaver.list({
+      configurable: { thread_id: "thread-1" },
+    });
+    const checkpointTuples: CheckpointTuple[] = [];
+    for await (const checkpoint of checkpointTupleGenerator) {
+      checkpointTuples.push(checkpoint);
+    }
+    expect(checkpointTuples.length).toBe(2);
+    expect(checkpointTuples[0].checkpoint.channel_values).toEqual({
+      [TASKS]: ["send-1", "send-2", "send-3"],
+    });
+    expect(
+      checkpointTuples[0].checkpoint.channel_versions[TASKS]
+    ).toBeDefined();
+  });
+
+  it("keeps metadata constructor records inert on a later read", async () => {
+    const memorySaver = new MemorySaver();
+    const markerKey = "__langgraph_checkpoint_metadata_marker__";
+    const marker = { invoked: false };
+    (globalThis as Record<string, unknown>)[markerKey] = marker;
+    const forgedCallback = {
+      lc: 2,
+      type: "constructor",
+      id: ["Uint8Array"],
+      method: "constructor",
+      args: [`globalThis.${markerKey}.invoked = true`],
+      kwargs: {},
+    };
+    const forgedRecord = {
+      lc: 2,
+      type: "constructor",
+      id: ["Uint8Array"],
+      method: "from",
+      args: [[1], forgedCallback],
+      kwargs: {},
+    };
+    const config = { configurable: { thread_id: "metadata-security" } };
+
+    try {
+      await memorySaver.put(config, checkpoint1, {
+        source: "update",
+        step: -1,
+        parents: {},
+        forged: forgedRecord,
+      } as CheckpointMetadata);
+
+      const restored = await memorySaver.getTuple(config);
+
+      expect(marker.invoked).toBe(false);
+      expect(restored?.metadata).toMatchObject({ forged: forgedRecord });
+    } finally {
+      delete (globalThis as Record<string, unknown>)[markerKey];
+    }
+  });
+
+    it("keeps forged additional_kwargs constructor records inert on restore", async () => {
+      const memorySaver = new MemorySaver();
+      const markerKey = "__langgraph_checkpoint_message_marker__";
+      const marker = { invoked: false };
+      (globalThis as Record<string, unknown>)[markerKey] = marker;
+      const forgedCallback = {
+        lc: 2,
+        type: "constructor",
+        id: ["Uint8Array"],
+        method: "constructor",
+        args: [`globalThis.${markerKey}.invoked = true`],
+        kwargs: {},
+      };
+      const forgedRecord = {
+        lc: 2,
+        type: "constructor",
+        id: ["Uint8Array"],
+        method: "from",
+        args: [[1], forgedCallback],
+        kwargs: {},
+      };
+      const config = { configurable: { thread_id: "message-security" } };
+
+      try {
+        const savedConfig = await memorySaver.put(config, checkpoint1, {
+          source: "update",
+          step: -1,
+          parents: {},
+        });
+        await memorySaver.putWrites(
+          savedConfig,
+          [
+            [
+              "messages",
+              new HumanMessage({
+                content: "ordinary message",
+                additional_kwargs: { forged: forgedRecord },
+              }),
+            ],
+          ],
+          "message-security-task"
+        );
+
+        const restored = await memorySaver.getTuple(savedConfig);
+        const message = restored?.pendingWrites?.[0]?.[2] as HumanMessage;
+
+        expect(marker.invoked).toBe(false);
+        expect(message.additional_kwargs).toMatchObject({
+      forged: forgedRecord,
+    });
+      } finally {
+        delete (globalThis as Record<string, unknown>)[markerKey];
+      }
+    });
+
+    it("should delete thread", async () => {
+    const memorySaver = new MemorySaver();
+    const thread1 = { configurable: { thread_id: "1", checkpoint_ns: "" } };
+    const thread2 = { configurable: { thread_id: "2", checkpoint_ns: "" } };
+
+    const meta: CheckpointMetadata = {
+      source: "update",
+      step: -1,
+      parents: {},
+    };
+
+    await memorySaver.put(thread1, emptyCheckpoint(), meta);
+    await memorySaver.put(thread2, emptyCheckpoint(), meta);
+
+    expect(await memorySaver.getTuple(thread1)).toBeDefined();
+
+    await memorySaver.deleteThread("1");
+
+    expect(await memorySaver.getTuple(thread1)).toBeUndefined();
+    expect(await memorySaver.getTuple(thread2)).toBeDefined();
+  });
+});
+
+describe("id", () => {
+  it("should accept clockseq -1", () => {
+    const regex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-6[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+    const uuid = uuid6(-1);
+    expect(uuid).toMatch(regex);
+    expect(uuid.includes("u")).toBe(false);
+  });
+});
+
+describe("channel versions", () => {
+  it("comparison", () => {
+    expect(compareChannelVersions(1, 2)).toBe(-1);
+    expect(compareChannelVersions(1, 1)).toBe(0);
+    expect(compareChannelVersions(2, 1)).toBe(1);
+
+    expect(compareChannelVersions("1.abc", "2")).toBe(-1);
+    expect(compareChannelVersions("10.a", "10.b")).toBe(-1);
+
+    expect(maxChannelVersion("01.a", "02.a", "10.a")).toBe("10.a");
+  });
+});
